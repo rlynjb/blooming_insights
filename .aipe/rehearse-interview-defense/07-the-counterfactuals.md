@@ -2,267 +2,329 @@
 
   ## Opening hook
 
-The senior-engineer move on this question is to volunteer what you'd reconsider before being asked. It signals two things at once: you're not romantically attached to your own decisions, and you've actually thought about which ones have the highest revisit value. Junior engineers defend everything. Senior engineers defend the load-bearing things and volunteer the rest.
+The senior-engineer move is to volunteer what you'd reconsider before being asked. Most candidates wait for the interviewer to ask "what would you do differently?" and treat the question defensively. Senior candidates use the reflection question as a hook to demonstrate they own the whole system — not just what shipped, but what could have shipped differently.
 
-This is also the chapter most likely to backfire. The trap is fabricating regrets for decisions that were obviously right. "Oh I wish I hadn't used TypeScript" is the wrong answer — not because someone might believe you, but because the interviewer hears a candidate who can't tell the difference between a load-bearing decision and a settled one. The strong shape is a *would-not-change list* up front (so they know your baseline is grounded) followed by the *four real reconsiderations* with each one's trigger named.
+But there's a trap. If you fabricate regrets to sound self-aware, you signal the opposite. "I really regret not writing more tests" from someone who wrote 221 passing tests reads as performative. The correct posture is a bounded list of *real* things you'd reconsider, each with the *trigger* that would cause you to actually make the change — and a bounded list of things you would NOT change, with receipts.
 
-  ## The picture you draw — the counterfactuals matrix
+This chapter walks the four decisions you'd reconsider (with triggers) and the four you would keep (with receipts). Both lists are load-bearing. The reconsider list shows self-awareness; the would-not list shows conviction. Volunteer both.
 
-```
-  Counterfactuals — what stays, what you'd revisit, what triggers the revisit
+  ## The chapter-opening diagram
 
-  ┌─ WOULD NOT CHANGE (the receipts) ──────────────────────────────────────┐
-  │  NDJSON over fetch + shared readNdjson kernel                          │
-  │     → receipt: same kernel powers 4 streaming surfaces today           │
-  │  TypeScript                                                            │
-  │     → receipt: the type surface caught the schema drift on each       │
-  │       MCP unwrap change                                                │
-  │  DataSource seam + adapter pattern                                     │
-  │     → receipt: survived 2 adapter swaps without changing caller        │
-  │       surface — that's the receipt, not future-proofing                │
-  │  AptKit primitive boundary                                             │
-  │     → receipt: library owns the loop, I own the boundary,             │
-  │       legacy preserved at base-legacy.ts:86-176                        │
-  └────────────────────────────────────────────────────────────────────────┘
-
-  ┌─ WOULD RECONSIDER (with trigger) ──────────────────────────────────────┐
-  │                            │                                            │
-  │  decision                  │  trigger that flips it                     │
-  │  ──────────────────────────┼──────────────────────────────────────────  │
-  │  1. No DB (cross-instance  │  Vercel runs more than one warm instance  │
-  │     state remains open)    │  in rotation for the same user             │
-  │                            │                                            │
-  │  2. Demo-replay as the     │  the alpha Bloomreach server's token       │
-  │     reliability path        │  lifetime extends past the briefing       │
-  │                            │  duration AND rate limits stabilize        │
-  │                            │                                            │
-  │  3. Fixed ~1.1s call       │  measured rate-limit headroom AND a real   │
-  │     spacing (Bloomreach)   │  metric showing some users blocked         │
-  │                            │  by the floor                              │
-  │                            │                                            │
-  │  4. Tool-coverage deps as  │  a second workspace that uses different    │
-  │     exact event-name match │  event naming for the same concepts         │
-  └────────────────────────────────────────────────────────────────────────┘
-```
-
-Four reconsiderations. Each one has a trigger. The trigger is the senior signal — it shows the decision isn't "I'd reconsider this someday" but "I'd reconsider this *when* X."
-
-  ## The body — would-not-change first, then the four reconsiderations
-
-  ### The would-not-change list (volunteered up front)
+The counterfactuals matrix. Each decision on the left; what you'd reconsider on the right; the trigger for reconsidering in the middle.
 
 ```
-  ┌─────────────────────────────────────────────────────────────┐
-  │ THEY ASK                                                    │
-  │   "What would you do differently if you were starting       │
-  │    today?"                                                   │
-  │                                                              │
-  │ WHAT THEY'RE TESTING                                         │
-  │   Will you fabricate regrets to sound humble, or will you   │
-  │   distinguish settled decisions from open ones? Can you     │
-  │   defend the things that stay AND name the things that      │
-  │   change?                                                    │
-  └─────────────────────────────────────────────────────────────┘
+  Counterfactuals matrix — what you'd reconsider, when
+
+  DECISION                    │ TRIGGER TO RECONSIDER      │ THE CHANGE
+  ─────────────────────────── │ ──────────────────────────  │ ────────────
+                              │                            │
+  No DB (in-memory state)     │ multi-instance deploy      │ durable
+    concurrent-user wipe        or cross-instance state    │ session
+    resolved via session-key    surfaces as a real issue   │ store
+                              │                            │
+  Monitoring routing          │ ONE real production        │ route
+    DEFERRED — not routed to    briefing measured for       │ monitoring
+    Haiku on Sonnet cost        cost and quality           │ to Haiku
+                              │                            │
+  Blind calibration           │ 30-60 min of blind human   │ swap
+    Session D pilot was         labeling by me OR a        │ Session D
+    AI-vs-AI, pilotWarning      collaborator               │ for real
+    stamped                     data                       │ data
+                              │                            │
+  Real load run               │ ~$2.50 in API spend +      │ full
+    smoke tests at N=2, N=3     ~2 hours to run and         │ LOAD_N=30
+    only                        analyze                    │ LOAD_K=5
+                              │                            │
+
+  WOULD NOT CHANGE — with receipts
+
+  ─────────────────────────── │ ──────────────────────────
+                              │
+  NDJSON + readNdjson kernel  │ 4 streaming surfaces
+                              │ consume one 64-LOC kernel
+                              │
+  DataSource seam + adapters  │ 4 uses, 0 caller changes
+                              │
+  AptKit primitive boundary   │ Legacy loop preserved as
+                              │ rollback receipt
+                              │
+  Portfolio hardening seq.    │ 6 phases, all shipped,
+                              │ every claim receipt-backed
+                              │
 ```
 
-**Strong answer (the opener — volunteer the would-not-change list first):**
+Four decisions to reconsider. Four decisions to keep. Every reconsideration has a trigger; every keep has a receipt. This is what the reflection round should look like.
 
-> "Four things I'd keep exactly as they are, and then four I'd reconsider.
+  ## The reconsider list — four things you'd revisit
+
+  ### 1. No database — trigger: multi-instance deploy
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "You don't have a database. Wouldn't you        │
+│   want one?"                                    │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Did you consider persistence? Do you know     │
+│   what state actually needs to persist? Or did  │
+│   you just skip the storage layer because it's  │
+│   annoying?                                     │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"I don't have a database and I'm intentional about that. State lives in `lib/state/insights.ts` as `Map<sessionId, SessionFeed>` — in-memory, session-keyed. The concurrent-user issue that used to exist here is fixed — but the underlying decision is 'no persistence at all,' and I own that.*
 >
-> What I'd keep: the NDJSON streaming contract with a single shared `readNdjson` kernel — the receipt is that one kernel powers four streaming surfaces in the app today (briefing, investigation, demo capture, tests) and the contract has held across every refactor. TypeScript — every MCP unwrap change shifted the type surface and that surface caught the drift before runtime. The DataSource seam with its adapter pattern — the receipt isn't future-proofing, it's that the seam *already survived* two adapter swaps without changing what the agents call. And the AptKit primitive boundary — three small adapter classes, library owns the loop, I own the boundary, legacy hand-rolled loop preserved at `lib/agents/base-legacy.ts:86-176` as a rollback receipt.
+> *The trigger to reconsider is any multi-instance deploy. Vercel Functions can cold-start on any instance; if my traffic warrants multi-instance capacity, session state has to survive an instance change. Today it doesn't.*
 >
-> Now the four I'd reconsider — and each has a specific trigger."
-
-```
-  ┃ "I'm not future-proofing for a swap I haven't done.
-  ┃  I've done two. The seam is paid for."
-```
-
-  ### Reconsideration 1 — no database (cross-instance state)
-
-```
-  ┌─────────────────────────────────────────────────────────────┐
-  │ THEY ASK                                                    │
-  │   "You really wouldn't add a database?"                     │
-  │                                                             │
-  │ WHAT THEY'RE TESTING                                        │
-  │   Do you understand that the right architecture today is    │
-  │   not always the right architecture tomorrow? Can you name  │
-  │   the trigger that flips the call?                          │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Strong answer:**
-
-> "Today, no. The data the user cares about historically lives in Bloomreach already — I'm not building a system of record, I'm reading one. Briefings are ephemeral. Cross-session state was a real concern and I addressed it the right way at the right time: when I had a concurrent-user bug in `lib/state/insights.ts` — module-level Map with `clear()` wiping other users mid-briefing — I session-keyed the map. That bug is resolved.
+> *The change would be a durable session store. Vercel KV or Upstash Redis for the low-latency path. The DataSource port doesn't cover session state today — that's the miss I'd fix. If I'd built `SessionStore` as a port from day one alongside `DataSource`, the swap would be a same-day change. Instead it would be a real refactor.*
 >
-> What's still open is cross-instance state. If Vercel adds a second warm instance to the rotation for the same user, their session state doesn't follow them across instances. The trigger to add a database is exactly that: a second warm instance in the rotation. At one warm instance the in-memory model is correct and any database is overhead I'm paying for nothing. At two it stops being correct.
+> *The reason I haven't shipped it: no production users yet. Building a durable session store for zero users is premature. But I know the trigger, I know the fix, and the DataSource seam shape is the pattern to reach for."*
+
+  ### 2. Monitoring routing to Haiku — trigger: one real briefing measured
+
+This one is the interesting reconsideration because it's a decision you *deferred* on purpose. That's a senior signal by itself.
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "Your monitoring agent runs on Sonnet. That's │
+│   expensive. Why not route it to Haiku for       │
+│   cost?"                                        │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you know the cost/quality tradeoff? Have   │
+│   you thought about model routing, or did you   │
+│   just pick one model?                          │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"I deferred that decision on purpose. Here's the reasoning.*
 >
-> When the trigger fires, the change is bounded. The session-keyed maps already isolate per-user state — moving them behind a key-value store with the same `sessionId` keys is mostly an adapter swap, conceptually the same move as `BloomreachDataSource` to `SyntheticDataSource`."
-
-  ### Reconsideration 2 — demo-replay as the reliability path
-
-```
-  ┌─────────────────────────────────────────────────────────────┐
-  │ THEY ASK                                                    │
-  │   "Demo mode is the default — that's weird for a real app.  │
-  │    Why?"                                                    │
-  │                                                             │
-  │ WHAT THEY'RE TESTING                                        │
-  │   Do you have a real reason for the default, or is it       │
-  │   hiding from a problem? Can you name what would flip       │
-  │   the default?                                              │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Strong answer:**
-
-> "Demo is the default because the alpha Bloomreach server isn't a presentation-grade dependency. Tokens revoke in minutes; the server occasionally 500s; the rate limit is shared. For a presentation, a demo, or anyone who wants to see what the app *does*, live mode is hostile.
+> *Routing monitoring to Haiku is exactly the kind of cost optimization that sounds obvious. But my eval flywheel today measures only diagnosis and recommendation quality. It does not measure monitoring quality. If I routed monitoring to Haiku blind, I'd be making the same anti-pattern the eval flywheel exists to prevent — optimizing without measuring.*
 >
-> The committed demo snapshot solves this honestly: `lib/state/demo-*.json` is a real captured run — real agent output, real tool calls, real numbers — that any instance can serve instantly as plain JSON. Cards, logs, comparison bars, recommendations all render from real data. Where a field wasn't captured at capture time, the UI shows `--`, not a fake.
+> *So the deferral is not laziness. It's evidence-driven. Until I have a monitoring rubric with goldens, routing to Haiku is a change I can't measure. And a change I can't measure is a change I don't ship.*
 >
-> The trigger to flip the default to live is when the alpha server's token lifetime is longer than a typical briefing AND the rate limit doesn't degrade under realistic concurrent load. Both are upstream changes, not changes I can make. Until then, demo-first is the right default."
-
-```
-  ┌─────────────────────────┬─────────────────────────────────┐
-  │ WEAK ANSWER             │ STRONG ANSWER                   │
-  ├─────────────────────────┼─────────────────────────────────┤
-  │ "Yeah I'd love to make  │ "Demo is the default because    │
-  │  live the default but   │  the alpha server isn't         │
-  │  it's flaky right now." │  presentation-grade — tokens    │
-  │                         │  revoke in minutes, rate limit  │
-  │                         │  is shared. Trigger to flip:    │
-  │                         │  upstream auth lifetime extends │
-  │                         │  past a briefing AND rate limit │
-  │                         │  stays stable under load."      │
-  ├─────────────────────────┼─────────────────────────────────┤
-  │ Why it's weak: "flaky"  │ Why it works: names what's     │
-  │ is a feeling. Doesn't   │ specifically wrong about the    │
-  │ name the specific       │ upstream, names the conditions  │
-  │ constraint or what       │ that would flip the decision,  │
-  │ would change it.        │ and owns the design today.     │
-  └─────────────────────────┴─────────────────────────────────┘
-```
-
-  ### Reconsideration 3 — fixed ~1.1s call spacing
-
-```
-  ┌─────────────────────────────────────────────────────────────┐
-  │ THEY ASK                                                    │
-  │   "Why a fixed 1.1-second floor between Bloomreach calls?   │
-  │    Why not exponential backoff or token-bucket?"            │
-  │                                                             │
-  │ WHAT THEY'RE TESTING                                        │
-  │   Do you understand the rate-limit shape you're working     │
-  │   against? Did you measure or did you guess? When would     │
-  │   you tune it?                                              │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Strong answer:**
-
-> "The ~1.1s spacing in `BloomreachDataSource` is a conservative floor I picked based on the alpha server's documented 'roughly one request per second' soft limit, with a safety margin to avoid skating the edge of the 429. The retry-on-429 in `McpClient` is the second layer if the floor proves wrong on a given call.
+> *The trigger to reconsider is one real production briefing measured for both cost and quality. The change is straightforward — the model provider is injected into `AnthropicModelProviderAdapter`, so routing monitoring to a different model is a one-line change. The gate is the measurement, not the implementation.*
 >
-> I didn't measure the actual headroom. I guessed conservatively and it works — which is fine for an alpha substrate, but it's a guess. The trigger to revisit is two things together: an actual measurement of rate-limit headroom (how close to the boundary the server lets me skate before 429s start), AND a real metric showing some users are blocked by the 1.1s floor itself rather than by the server.
->
-> Today neither is true. The 1.1s floor is well within the budget; the briefings that feel slow feel slow because of *number* of tool calls, not pacing of each. So I'd revisit on measurement, not on impulse."
+> *That's the honest version of 'why haven't you optimized cost more.' Because I built the flywheel to stop myself from doing exactly that."*
 
-  ### Reconsideration 4 — exact-match tool-coverage dependencies
+┃ "The deferral is not laziness. It's evidence-driven.
+┃  A change I can't measure is a change I don't ship."
+
+┌─────────────────────────┬─────────────────────────┐
+│ WEAK ANSWER             │ STRONG ANSWER           │
+├─────────────────────────┼─────────────────────────┤
+│ "Yeah, I could probably │ "I deferred that on     │
+│ save some money by      │ purpose. My eval        │
+│ using Haiku for the     │ measures diagnosis and  │
+│ monitoring pass. I'll   │ recommendation quality  │
+│ get to that."           │ but not monitoring. If  │
+│                         │ I routed to Haiku blind │
+│                         │ I'd be optimizing       │
+│                         │ without measuring —     │
+│                         │ the exact anti-pattern  │
+│                         │ the flywheel exists to  │
+│                         │ prevent. Trigger: one   │
+│                         │ real briefing measured. │
+│                         │ Change is a one-line    │
+│                         │ swap through the        │
+│                         │ ModelProvider adapter." │
+├─────────────────────────┼─────────────────────────┤
+│ Why it's weak:          │ Why it works:           │
+│ "I'll get to that"      │ Frames the deferral as  │
+│ signals procrastination │ evidence-driven,        │
+│ or lack of framework.   │ demonstrates you built  │
+│ Doesn't defend the      │ the flywheel to make    │
+│ deferral. Doesn't       │ these decisions the     │
+│ demonstrate the         │ right way. Names the    │
+│ discipline behind it.   │ trigger and the fix.    │
+└─────────────────────────┴─────────────────────────┘
+
+  ### 3. Blind calibration — trigger: 30-60 min of human labeling
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "Your eval judge is an LLM. How do you know   │
+│   it's actually good at judging?"               │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you know the standard critique of LLM-as-  │
+│   judge? Have you thought about calibration?    │
+│   Or are you just hoping the numbers mean       │
+│   something?                                    │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"The eval judge is a Sonnet call with a structured rubric — four dimensions, five-point scale, three verdicts. It's an LLM judging LLM output. That's exactly the setup people are rightly skeptical of.*
+>
+> *What I've done: I ran a Session D pilot with the calibration protocol, and I stamped every output with `pilotWarning`. Because Session D was AI-vs-AI. Two Sonnet judges scoring the same responses. The verdict agreement was 6 of 6 — 100 percent. Exact-match at 13 of 24, 54 percent. Within-1 at 24 of 24, 100 percent. Those are stress-test numbers, not calibration numbers.*
+>
+> *The honest position is that I have not yet done real blind human calibration. That's a real gap. The `pilotWarning` field exists specifically so I don't confuse the Session D output with real calibrated data. When I read those numbers, I read them as 'the judge is internally consistent' — not as 'the judge tracks human judgment.'*
+>
+> *The trigger to close the gap is 30 to 60 minutes of my own blind labeling, or a collaborator's. The protocol is in the repo. The infrastructure is ready. The bottleneck is my own time.*
+>
+> *Until that's done, I use the eval judge with the caveat baked in. That caveat is why I put the regression gate at 10 percentage points on a 100-point scale, not tighter. If the judge is noisy, the gate has to be looser than the noise floor."*
+
+The move: name the concern the interviewer has ("LLM judging LLM"). Show you knew it. Show what you did about it (Session D pilot with pilotWarning). Name the honest gap (no real human calibration). Name the trigger. Name why the gate is set the way it is.
+
+  ### 4. Real load run — trigger: $2.50 and 2 hours
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "You've got a load harness. What do the load  │
+│   numbers actually look like?"                  │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Have you actually run it, or did you just     │
+│   write it? Do you know the numbers?            │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"Honestly: I've written the harness at `eval/load.eval.ts`, semaphore-based, parameterized by `LOAD_N` and `LOAD_K`. I've smoke-tested at N=2 and N=3 to prove the mechanism works. I have not run a real load test.*
+>
+> *A real run at LOAD_N=30 with LOAD_K=5 would cost approximately $2.50 in API spend and about two hours of my time end-to-end. It hasn't happened because the value of that run is a set of numbers I'd communicate to whoever asks — and until someone asks, I've been sequencing higher-leverage work.*
+>
+> *What I can tell you today is baseline p50 latency from the single-case eval. Diagnose 50 seconds. Recommend 51 seconds. Judge phases 38 and 90 seconds. Total 225 seconds per case at concurrency 1. Under concurrency 5, I expect Anthropic rate limits and MCP server rate limits to be the first non-linear degradation. I don't have that number yet.*
+>
+> *The trigger is somebody who needs it. If you're asking, I'll run it tonight. That's the honest sequencing."*
+
+The senior move here is turning "I haven't done it" into a clean sequencing statement. Not "I forgot" or "I'll get to it" — "the value of that number is downstream of somebody needing it." That's how senior engineers actually sequence work.
+
+  ## The would-not-change list — four things with receipts
+
+The senior move is not just naming reconsiderations. It's holding ground on decisions that were right. Four decisions with receipts you'd defend against any pushback:
+
+  ### 1. NDJSON + readNdjson kernel — receipt: 4 streaming surfaces
+
+> *"NDJSON over Server-Sent Events was the right call. Four different streaming surfaces in the codebase — `/api/briefing`, `/api/agent` for diagnose, `/api/agent` for recommend, `/api/agent` for the free-form query — all consume one 64-line kernel called `readNdjson`. Four surfaces, one kernel, one framing. SSE would have added a second framing layer and broken POST support on `/api/agent`. That decision stands."*
+
+  ### 2. DataSource seam + adapters — receipt: 4 uses, 0 caller changes
+
+> *"The DataSource port is 71 lines. It's shipped in four uses — Bloomreach, Synthetic for offline eval, FaultInjecting decorator, and one demo adapter I added and removed. Every use of that port required zero changes to caller code. That's the strongest architectural receipt in the whole system. I'd design it the same way again."*
+
+  ### 3. AptKit primitive boundary — receipt: legacy loop preserved
+
+> *"AptKit owns the agent loop; I own the boundary through three adapter classes at ~263 LOC. The legacy pre-AptKit loop is preserved in the repo at `*-legacy.ts` as a rollback receipt. If AptKit disappeared or became a liability, I swap the adapters, put the legacy loop back. That's not architectural regret; that's insurance. Same call again."*
+
+  ### 4. Portfolio hardening sequence — receipt: 6 phases, all shipped
+
+> *"The six-phase hardening plan — eval, observability, cost, load and fault, regression gate, CI — shipped in that exact order because each phase depended on the one before it. You can't run a regression gate without a baseline. You can't have a baseline without an eval. You can't measure cost without observability. That sequence is not accidental. I'd sequence it identically again."*
+
+  ## The follow-up decision tree
+
+The reflection round has one specific follow-up shape you should be ready for:
 
 ```
-  ┌─────────────────────────────────────────────────────────────┐
-  │ THEY ASK                                                    │
-  │   "Your tool-coverage map depends on exact event-name        │
-  │    matches. What happens on a second workspace?"             │
-  │                                                              │
-  │ WHAT THEY'RE TESTING                                         │
-  │   Have you thought about generalizing past the one workspace │
-  │   you built against? Or have you hard-coded yourself in?    │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Strong answer:**
-
-> "Today, tool-coverage in `lib/mcp/tool-coverage.ts` checks for specific Bloomreach event names — `purchase`, `view_item`, `cart_update`, `checkout`, `session_start`. These are the events the current workspace exposes; the agents depend on them; the coverage grid in the UI tells the user which categories are diagnosable.
->
-> The gap is: if I dropped this app onto a second Bloomreach workspace with the same conceptual events under different names — say `order_placed` instead of `purchase` — the coverage grid silently goes red for events the workspace actually has. The agent then refuses to investigate a category it could have handled.
->
-> The fix is an alias layer: each agent-conceptual dependency maps to a set of acceptable workspace-actual names. The trigger to do this work is a second workspace. Today I have one workspace and shipping the alias layer would be speculative abstraction — the same mistake I'd be calling out elsewhere. The seam where the alias would land is already isolated, so when the second workspace appears the change is bounded to one file."
-
-```
-  ┃ "Speculative abstraction is the same mistake at both
-  ┃  ends — building the seam too early is as wrong as
-  ┃  never building it. The trigger names the right moment."
+  You volunteer the four reconsideration items.
+        │
+        ▼
+  ┌─► "That's honest. What else would you change?"
+  │      Beware — the interviewer is testing whether
+  │      you have a bounded list or an infinite one.
+  │      Correct answer: "Those are the four real ones.
+  │      Everything else in the codebase is either
+  │      shipped, working, and I'd repeat, or it's a
+  │      known limitation I've named elsewhere."
+  │      Don't invent more.
+  │
+  ├─► "What about the frontend? Any regrets there?"
+  │      One honest one: extracting the readNdjson
+  │      kernel came late — day 40, not day 1. The
+  │      four streaming surfaces briefly diverged
+  │      before consolidation. It cost a week. If I
+  │      built again, I'd extract the shared reader
+  │      before the second surface existed.
+  │
+  ├─► "Would you change the framework?"
+  │      No. Next.js 16's App Router streaming is
+  │      the primitive my product depends on. See
+  │      Chapter 3.
+  │
+  └─► "Would you use a different model?"
+       Not for the agent tier — Sonnet 4.6 with
+       prompt caching is the right cost/quality
+       point for diagnosis and recommendation.
+       The Haiku call for classifyIntent was
+       deliberate. Monitoring routing to Haiku
+       is on the reconsider list with a trigger.
 ```
 
   ## When you don't know
 
-The trap on this chapter is being asked about a counterfactual you *should* have considered but didn't think to volunteer — an entirely different shape of the system the interviewer thinks you should have weighed.
+Reflection questions can pull you into competitive-comparison territory you haven't lived in. If they ask "how does your approach compare to what Anthropic itself does internally?" the honest answer is you don't know.
 
 ```
-  ╔═══════════════════════════════════════════════════════════════╗
-  ║ WHEN YOU DON'T KNOW                                           ║
-  ║                                                               ║
-  ║   They ask: "Would you have considered building this as a     ║
-  ║   chat agent — one conversation, the agent decides which      ║
-  ║   step (monitor / diagnose / recommend) to run next?"         ║
-  ║                                                               ║
-  ║   You did not seriously evaluate a single-agent conversational║
-  ║   shape against the three-agent pipeline shape you built.     ║
-  ║   You'd be guessing if you claimed to have weighed it.        ║
-  ║                                                               ║
-  ║   Say:                                                        ║
-  ║   "I didn't seriously evaluate a single-conversation agent    ║
-  ║    shape against the three-agent pipeline. I picked the       ║
-  ║    pipeline because the user flow already had three           ║
-  ║    distinct stages — monitor, investigate, decide — and       ║
-  ║    each maps cleanly to one agent with its own prompt and     ║
-  ║    its own output schema. A single chat agent would have      ║
-  ║    needed routing logic the user couldn't see, which          ║
-  ║    contradicts the 'show your work' product premise. But      ║
-  ║    that's a post-hoc defense — I didn't put both shapes       ║
-  ║    side-by-side at decision time. If you want to walk what   ║
-  ║    that comparison would look like, I'd be doing it on the   ║
-  ║    whiteboard with you, not from memory."                     ║
-  ║                                                               ║
-  ║   What this signals: honesty that you didn't run the          ║
-  ║   counterfactual at decision time, a real post-hoc defense    ║
-  ║   anchored to the product premise, willingness to do the      ║
-  ║   analysis in the room rather than confabulating one.         ║
-  ║                                                               ║
-  ║   Do NOT say:                                                 ║
-  ║   "I considered both and the pipeline was clearly better      ║
-  ║    because..." — fabricating a decision process you didn't    ║
-  ║   actually run is the worst move. Senior interviewers know   ║
-  ║   what real evaluation looks like and will probe.            ║
-  ╚═══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════╗
+║ WHEN YOU DON'T KNOW                           ║
+║                                               ║
+║   They ask: "If you'd done this at Anthropic  ║
+║   or OpenAI internally, what would have been  ║
+║   different?"                                 ║
+║                                               ║
+║   You have not worked at a frontier lab.      ║
+║   You have opinions from reading papers, but  ║
+║   not from being inside.                      ║
+║                                               ║
+║   Say:                                        ║
+║   "I haven't worked at a frontier lab. What   ║
+║    I'd guess — and it's a guess — is that     ║
+║    an internal team would have access to      ║
+║    tighter latency budgets, model-side        ║
+║    telemetry I don't get, and probably an     ║
+║    internal eval infrastructure that dwarfs   ║
+║    my 10-golden setup. What I built is        ║
+║    the outside-the-lab version — a           ║
+║    disciplined production-hardening pass on   ║
+║    a single-engineer project. I don't know    ║
+║    what that maps to internally. Do you       ║
+║    have context on how you'd think about      ║
+║    the comparison?"                          ║
+║                                               ║
+║   What this signals: honest scope of what     ║
+║   you can compare to. Guess labeled as a      ║
+║   guess. Willingness to learn in the room.    ║
+║   Handing the question back to them turns     ║
+║   an ambush into a conversation.              ║
+║                                               ║
+║   Do NOT say:                                 ║
+║   "Well, they'd probably use RLHF and        ║
+║    fine-tuning and constitutional AI…"        ║
+║   Buzzword-shopping is the surest way to      ║
+║   flag that you don't know what you're       ║
+║   talking about.                              ║
+╚═══════════════════════════════════════════════╝
 ```
 
-  ## What you'd change about the counterfactuals chapter itself
+  ## What you'd change
 
-If you were redoing how you *think about* counterfactuals on this project, the change you'd make is **logging the trigger conditions explicitly**, somewhere checked into the repo. Right now the triggers — "two warm instances," "stable upstream rate limit," "second workspace" — live in your head. The fix is a one-page `TRIGGERS.md` next to the counterfactuals, so the next maintainer (or you, six months later) doesn't have to rediscover them. The cost is one more doc to keep current. The payoff is a senior-team-shaped artifact: decisions with explicit revisit conditions.
+The meta-move for this chapter: the reconsider list itself is a receipt of taste. Four real triggers, four real changes, four decisions that you can defend as evidence-driven deferrals — that's a senior habit visible in one page. What you'd change about how you present it: nothing. The chapter is the shape.
 
-  ## One-page summary
+What you'd change about the actual project: the four items on the reconsider list. That's it. The rest — the four items on the would-not-change list — you'd repeat verbatim.
 
-**Core claim:** the senior move is to volunteer the would-not-change list first (so the interviewer knows your baseline is grounded), then walk four real reconsiderations each with a specific trigger. Decisions don't have abstract regrets; they have conditions that would flip them.
+  ## The one-page summary
 
-**Would not change:** NDJSON + shared `readNdjson` kernel (receipt: powers 4 surfaces); TypeScript (receipt: caught schema drift); DataSource seam (receipt: survived 2 adapter swaps); AptKit primitive boundary (receipt: legacy preserved as rollback).
+**Core claim.** Four decisions to reconsider, each with a real trigger. Four decisions to keep, each with a receipt. Both lists volunteered before being asked.
 
-**Would reconsider (with trigger):**
-1. *No DB* → trigger: a second warm Vercel instance for the same user. Cross-instance state remains open; the concurrent-user wipe is resolved.
-2. *Demo-replay as reliability path* → trigger: alpha server's auth lifetime extends past briefing duration AND rate limit stabilizes.
-3. *Fixed ~1.1s call spacing* → trigger: measured rate-limit headroom AND a metric showing users blocked by the floor.
-4. *Exact-match tool-coverage deps* → trigger: a second workspace with different event naming for the same concepts.
+**The four reconsiderations.**
 
-**Pull quotes:**
-```
-┃ "I'm not future-proofing for a swap I haven't done.
-┃  I've done two. The seam is paid for."
-```
-```
-┃ "Speculative abstraction is the same mistake at both
-┃  ends — building the seam too early is as wrong as
-┃  never building it. The trigger names the right moment."
-```
+  → No DB → trigger: multi-instance deploy. Fix: durable session store, ideally through a `SessionStore` port.
+  → Monitoring routing to Haiku → trigger: one real briefing measured. Fix: one-line ModelProvider swap.
+  → Blind calibration → trigger: 30-60 min of human labeling. Fix: swap Session D pilot data for real labeled data.
+  → Real load run → trigger: $2.50 in API spend + 2 hours. Fix: LOAD_N=30, LOAD_K=5.
 
-**What you'd change:** check the trigger conditions into the repo as `TRIGGERS.md`, so the revisit conditions are explicit rather than living in your head.
+**The four would-not-change decisions.**
+
+  → NDJSON + readNdjson kernel → 4 streaming surfaces, one 64-LOC kernel.
+  → DataSource seam + adapters → 4 uses, 0 caller changes.
+  → AptKit primitive boundary → legacy loop preserved as rollback receipt.
+  → Portfolio hardening sequence → 6 phases, all shipped, receipt-backed.
+
+**The pull quotes.**
+
+  → *"The deferral is not laziness. It's evidence-driven. A change I can't measure is a change I don't ship."*
+  → *"The senior-engineer move is to volunteer what you'd reconsider before being asked."*
+
+**What you'd change.** Nothing about how the reconsider list is presented. Only the four items themselves need work.

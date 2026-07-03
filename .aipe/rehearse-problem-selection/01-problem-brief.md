@@ -1,109 +1,97 @@
-# 01 — Problem Brief
+# The problem brief
 
-> Who experiences what pain, with what evidence, and why now.
+**The one file the review room reads first.** Who hurts, how much, what evidence, why now, who's inside scope, who's outside, what constraints hold.
+
+## The user — one person, one workflow
+
+The person you're building for: **a marketer or analyst working inside a Bloomreach Engagement ecommerce workspace**. Not a data scientist. Not a BI engineer. Someone whose job title says "growth" or "lifecycle marketer" and whose day includes a Bloomreach tab.
+
+The specific workflow they run manually today — the one this product replaces:
 
 ```
-  THE ANALYST'S CURRENT LOOP — what's being automated
+  The human-analyst loop, done by hand today
 
-  ┌─ context 1: dashboards ─────────┐
-  │  marketer notices a metric      │  "huh, revenue dropped"
-  │  moved in Bloomreach Engagement │
-  └─────────────┬───────────────────┘
-                │  switch context, lose state
-  ┌─ context 2: query / pivot ──────▼───────────────┐
-  │  hunt for the cause — by country? device?       │  "is this everywhere
-  │  segment? time window? regression?              │   or just Brazil?"
-  └─────────────┬───────────────────────────────────┘
-                │  switch context again
-  ┌─ context 3: Bloomreach features ▼───────────────┐
-  │  decide: scenario? segment? campaign? voucher?  │  "okay, what do I
-  │  with what configuration?                       │   actually DO about it?"
-  └─────────────────────────────────────────────────┘
-
-  three contexts · three tools · no continuity · all by hand
+  ┌─ 1. NOTICE ─────────────────────┐
+  │  scroll dashboards, spot        │
+  │  something moving               │
+  │  "purchase revenue looks off"   │
+  └──────────────┬──────────────────┘
+                 │  hours to days later
+                 ▼
+  ┌─ 2. DIAGNOSE ───────────────────┐
+  │  open the query tool,           │
+  │  write EQL, run comparisons,    │
+  │  form hypotheses, test them     │
+  │  "is it traffic? checkout?      │
+  │   a country? a segment?"        │
+  └──────────────┬──────────────────┘
+                 │  usually another session
+                 ▼
+  ┌─ 3. DECIDE ─────────────────────┐
+  │  which Bloomreach feature to    │
+  │  reach for — scenario? segment? │
+  │  campaign? voucher? experiment? │
+  │  what steps? what impact?       │
+  └─────────────────────────────────┘
 ```
 
-## The user
+Three stages. Notice → why → what to do. That's the loop. The pain isn't that any *one* stage is hard — it's that (a) it takes a human hours to walk it end to end and (b) most people stop at stage 1 or 2 because stage 3 requires product knowledge across all five Bloomreach action surfaces (scenarios, segments, campaigns, vouchers, experiments).
 
-**The marketer/analyst working inside a Bloomreach Engagement workspace.** Not a data scientist. Not an ML engineer. Someone whose job is to keep ecommerce metrics moving the right direction and who has to **explain to a stakeholder why they're recommending the action they're recommending.**
+## The pain, made concrete
 
-The user has to be able to tell their boss: "Brazil purchase revenue is down 38% over the last 90 days vs prior 90; it's localized to Brazil (other regions are flat); I want to launch a re-engagement campaign for Brazil customers who churned in the last 60 days." With **the numbers**, **the segment**, and **the feature** all named, with provenance.
+Look at what the marketer actually types in a normal day. It's not one query — it's a *sequence* of queries where each one is chosen based on what the previous one showed.
 
-## The pain (the three-context loop)
+- **Stage 1** (notice): "how did revenue trend the last 90 days?" → sees a dip → "is it global or a country?" → "which country?" → segment by `customer.country`.
+- **Stage 2** (diagnose): "did traffic drop?" → `session_start` counts over the window → "did checkout conversion drop?" → funnel counts view → cart → checkout → purchase → "did the drop hit new customers or repeat?" → segment split.
+- **Stage 3** (decide): matching the diagnosed cause to a Bloomreach feature. Checkout drop-off on repeat customers = a scenario. Country-scoped traffic drop = a campaign. New-vs-repeat difference = a segment definition.
 
-The diagram above is the workflow. Three things hurt about it:
+Every one of those queries is EQL, ad-hoc, against a workspace with **no saved dashboards or pre-built funnels**. The marketer has to write them (or ask an analyst to). The workspace `wobbly-ukulele` — the actual one this product ships against — has zero pre-built reports. Every number is computed on demand.
 
-1. **Context-switching cost.** Each tool has its own mental model, its own filters, its own segment definitions. The analyst loses state every time they switch.
-2. **No memory between steps.** What got hypothesized in step 2 has to be re-stated by hand in step 3. The hypothesis that produced the recommendation doesn't travel with it.
-3. **No provenance at the end.** When the analyst presents the recommendation, the chain of reasoning ("I queried X, saw Y, ruled out Z, therefore W") is locked in their head. The stakeholder either trusts the analyst or they don't.
+## The evidence — what the repo proves
 
-The third one is the load-bearing pain. **A recommendation without a visible chain of reasoning is a recommendation the stakeholder can't pressure-test.** That's the part the product has to fix — and the part the repo treats as a first-class surface, not a debug log.
+This is the part where you distinguish evidence from inference. The repo proves several load-bearing claims about the problem:
 
-## The evidence (what the repo proves)
+- **The workspace has no saved reports.** `lib/mcp/tools.ts` exposes the Bloomreach MCP tools, and `lib/mcp/schema.ts` walks the workspace on connect — the `WorkspaceSchema` has `events[]`, `customerProperties[]`, `catalogs[]`, but **no** `reports[]` or `funnels[]`. Every metric is ad-hoc EQL through `execute_analytics_eql`. That's not a design choice on this side — it's what the workspace actually is.
+- **The workflow is genuinely a sequence, not a lookup.** `lib/agents/base.ts` — the `runAgentLoop` — runs a Claude tool-use loop where the model decides which tool to call *next* based on the previous result. If the answer were a single lookup, you wouldn't need a loop. The loop's existence is a claim about the problem shape, and the agent trace files under `lib/state/demo-*.json` show 6–12 tool calls per diagnosis in practice. This isn't the tool making noise — it's the diagnostic path having that many steps.
+- **The three-stage separation is real.** The UI reflects it directly: `app/page.tsx` (feed = monitoring), `app/investigate/[id]/page.tsx` (step 2 = diagnostic only), `app/investigate/[id]/recommend/page.tsx` (step 3 = recommendation only). The stepper (`components/shared/ProcessStepper.tsx`) links them. This isn't a marketing decomposition — it's how the code is structured because the *task* is structured that way.
+- **The reasoning has to show itself.** `StatusLog` (`components/shared/StatusLog.tsx`) wrapping `ReasoningTrace` (`components/investigation/ReasoningTrace.tsx`) is the differentiator's shipped form. Every agent step and every tool call streams to the sidebar in real time, with duration and expandable results. If the analyst can't see *how* the AI reached its conclusion, they can't trust it enough to act on it. The repo shipping this as a first-class UI surface — not a debug panel — is the evidence the "shows its work" pitch is load-bearing.
 
-The workflow above isn't inferred — it's encoded in the repo's structure. Three pieces of evidence:
+**What's inference, not evidence:** the claim that the target user's baseline is manual (they don't have another AI analyst on Bloomreach). The repo can't prove that — it's a market observation about Bloomreach's current state. Flagging it because the review room will.
 
-### Evidence 1 — the three-stage stepper IS the analyst loop
+## Why now — what changed, what compounds
 
-The shared `ProcessStepper` component (`components/shared/ProcessStepper.tsx`, used on every page) has three steps: **monitoring anomalies → investigating the issue → decision & recommendation**. That's not a UX choice. That's the workflow being modeled. The split into **diagnose** and **recommend** as separate routes (`app/investigate/[id]/page.tsx` for diagnose, `app/investigate/[id]/recommend/page.tsx` for recommend, with `step=diagnose|recommend|null` on the `/api/agent` route) reflects the analyst's actual reasoning sequence: first form the hypothesis, then decide the action.
+Two things converged that make this problem tractable *now* in a way it wasn't 18 months ago.
 
-**Inference:** the analyst persona thinks in these three steps. (The repo encodes the steps; whether real Bloomreach analysts experience them as three steps is the discovery question — see below.)
+- **Bloomreach shipped an MCP server.** `loomi-mcp-alpha.bloomreach.com/mcp` (see `lib/mcp/connect.ts`). Before this existed, an AI agent talking to Bloomreach meant scraping the UI or reverse-engineering an internal API. The MCP server is the *supply-side* enablement — it makes the "AI reads Bloomreach data" step technically possible without vendor cooperation on custom integrations.
+- **Sonnet 4.6 is good enough at multi-turn tool use to run this loop.** `lib/agents/base.ts` uses `claude-sonnet-4-6` inside the agent loop; the diagnostic agent typically runs 6–12 tool calls per case. A model that stalls or loops after 3–4 tool calls can't do this workflow. Sonnet 4.6 can. That's the *demand-side* enablement.
 
-### Evidence 2 — EQL ad-hoc-only proves "no saved dashboards" is real
+Cost that compounds if the problem isn't solved: **every workspace where the marketer stops at stage 1 or stage 2**. The manual loop is skippable — you can look at a chart, decide it's fine, and move on. The action-taking stage (which Bloomreach feature to reach for) is exactly where the value lives, and it's the stage most likely to get abandoned. The longer the workspace sits without an analyst-loop closer, the more revenue-relevant anomalies go undiagnosed.
 
-`execute_analytics_eql` is the only metrics tool the agents call. There are no saved Bloomreach dashboards / funnels in this workspace to read from — every metric is computed ad-hoc. This proves the **monitoring step is currently un-automated** for any user of that workspace: there's nothing to glance at; you have to ask. That's the gap the monitoring agent (`lib/agents/monitoring.ts`) plugs.
+## Who's inside scope, who's outside
 
-The 90-day window enforcement (current 90d vs prior 90d, derived from 90d & 180d) is in the code because the dataset's sparse tail produces bogus ±100% swings on shorter windows. That's a constraint the repo discovered by running the loop against real data — not a guess.
+**Inside scope:**
+- A single Bloomreach ecommerce workspace (`wobbly-ukulele` is the reference).
+- The three-stage loop as it applies to *ecommerce metrics* — revenue, funnel, traffic, customer segments by country. Data model in `lib/mcp/types.ts` (`Anomaly`, `Diagnosis`, `Recommendation`).
+- Bloomreach action recommendations across all five feature surfaces: scenario, segment, campaign, voucher, experiment. See `lib/agents/prompts/recommendation.md`.
+- One user at a time, session-keyed. See the in-memory Map for insights in `lib/state/insights.ts` and investigations in `lib/state/investigations.ts`.
 
-### Evidence 3 — the reasoning trace is built as a product surface
+**Outside scope — deliberately:**
+- **Not a multi-tenant SaaS.** No user accounts, no team collaboration, no shared workspaces. The product runs against one Bloomreach OAuth connection at a time. This is Ch 02 material — the DB cut lives there.
+- **Not a Bloomreach replacement.** The product runs *inside* the marketer's Bloomreach workflow, reading the same data they'd read in Bloomreach's UI. It's a loop on top, not a rebuild underneath.
+- **Not other Bloomreach modules.** Content, discovery, recommendations-as-a-service — none of those. This is Engagement (the event/customer/campaign product) only.
+- **Not other analytics platforms.** No Segment adapter, no Amplitude adapter, no GA. The `DataSource` seam (`lib/mcp/tools.ts` + Synthetic adapter) exists partly so this *could* extend, but shipping-scope is Bloomreach.
 
-The `StatusLog` (`components/shared/StatusLog.tsx`) is a sticky sidebar on every page (feed + both investigate steps). It wraps `ReasoningTrace` (`components/investigation/ReasoningTrace.tsx`) which renders per-line **agent badge + step kind + content + timestamp**, with `ToolCallBlock`s showing status dot + tool name + duration + expandable JSON result. This is not a log file. It's not a debug panel hidden behind a dev flag. It's **a 1/3-width column of the main UI** alongside the 2/3-width insight column.
+## Constraints — what actually pins the shape
 
-The NDJSON streaming contract (`AgentEvent` in `lib/mcp/events.ts`: `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation | done | error`) carries the trace events as **first-class messages**, not as a side-channel. The route producers + UI consumers both depend on this — it's locked as "what must not change" in the project context.
+The constraints that show up in the code, not the ones on the whiteboard:
 
-**This is the strongest evidence:** when the product team commits to "the reasoning trace is part of the contract, not the debug output," that's a deliberate stance on **what kind of analytics product this is.** The bet is on trust, not magic.
+- **The MCP server rate-limits at ~1 req/s and revokes tokens after minutes.** `lib/mcp/client.ts` has the retry + rate-limit logic; `app/page.tsx` has the auto-reconnect-once-on-`invalid_token` guard. This is why demo mode exists at all — a live demo against the alpha server is not reliable for a 15-min presentation window. The presentation reliability constraint pinned the demo/live toggle in `app/page.tsx` (persisted in `localStorage` `bi:mode`).
+- **The workspace has no pre-built reports.** Everything through `execute_analytics_eql`. The agent has to *decide* which EQL to run. This is why an LLM-in-the-loop makes sense at all — if there were a `getRevenueDashboard()` API, this would be a scripted ETL, not an agent.
+- **Vercel Pro function timeout: 300s.** `maxDuration = 300` on `/api/briefing` and `/api/agent`. That's the streaming envelope. Anything requiring longer than 5 minutes of continuous streaming has to be redesigned (which is why the recommend step runs as a separate request after diagnose).
+- **Presentation-first delivery.** The primary consumers of this product right now are you (for interview loops) and interviewers (for evaluating you). "Reliable demo path" is a first-class requirement, not a nice-to-have. It pinned the committed `lib/state/demo-*.json` snapshots and the demo/live toggle.
 
-## Why now
+## What kind of problem this is
 
-Three things that make this the right moment, in order of how repo-visible they are:
+Name it directly for the interviewer's mental model: this is an **AI product problem, not an AI research problem**. You're not proving a novel technique. You're taking a well-understood pattern — LLM + tool use + streaming — and applying it to a workflow that currently doesn't have an AI-native version, in a way that respects the reality of the underlying data platform (Bloomreach MCP alpha), the model (Claude Sonnet 4.6), and the interface (web browser, streamed sidebar).
 
-1. **The MCP layer exists.** Bloomreach shipped the loomi connect MCP server in alpha. Before MCP, an integration like this would have meant a custom API client per feature surface (events, segments, scenarios, campaigns). The MCP surface flattens that into a tool-call interface the agent can drive — `lib/mcp/tools.ts` lists the tools the agent gets for free. **The integration cost just collapsed.**
-2. **The model is good enough.** `claude-sonnet-4-6` is the agent model; `claude-haiku-4-5-20251001` is the intent classifier. Eighteen months ago, sustaining a multi-turn diagnosis (form hypothesis → test against data → refine) was a research project. Today it's a working loop in `lib/agents/diagnostic.ts` — built on `@aptkit/core@0.3.0` after migrating from a hand-rolled `runAgentLoop` (legacy preserved at `lib/agents/base-legacy.ts` as a rollback receipt). The capability isn't the differentiator anymore; the **trust surface** is.
-3. **The streaming UI primitive landed.** NDJSON over `ReadableStream` (consumed in the browser via `fetch` + a stream reader, not `EventSource` — see `lib/mcp/events.ts`) is what makes the "show your work" surface possible at human-perceptible latency. Without first-class streaming, the trace would arrive as a wall of text after the conclusion — defeating the entire point.
-
-## Beneficiaries and exclusions
-
-**Who benefits:** the marketer/analyst inside a Bloomreach Engagement workspace whose job involves the three-context loop above and who has to **explain their recommendations to a stakeholder.**
-
-**Who is intentionally excluded — and what their problem is:**
-
-- **Data engineers / analytics engineers.** They have SQL, dbt, notebooks, and BI tools that already chain query-and-explain. They don't need this product; they need pipelines.
-- **Multi-workspace customer success / agency teams.** No multi-tenant isolation in the repo — one workspace per session. (See `lib/mcp/auth.ts` — the OAuth client is per-user.) Serving them would mean re-architecting auth, state, and rate limits.
-- **Non-Bloomreach users.** The MCP server is the seam, and it's Bloomreach-specific. Generalizing the agents to "any ecommerce analytics platform" is a different product. (The agent layer is somewhat portable — see `lib/agents/aptkit-adapters.ts` for the boundary — but the tool inventory in `lib/agents/tool-schemas.ts` is Bloomreach-shaped.)
-- **Read-only stakeholders who consume the analyst's output.** The product is the analyst's tool, not the stakeholder's report. Export-to-markdown exists (`lib/export/investigationMarkdown.ts`) as the bridge.
-
-## Constraints (visible from the repo)
-
-The constraints are not aspirational — they're enforced in code:
-
-- **Bloomreach alpha MCP server rate limit.** ~1 req/s in `lib/mcp/client.ts`, with retry. **Any feature that needs sub-second multi-call interactivity is off the table** until the server matures.
-- **Token revocation after minutes.** The alpha server revokes tokens; the feed has auto-reconnect on `invalid_token` (`app/page.tsx`). **Long-running background monitoring is off the table** until token lifetimes are stable.
-- **No database.** State lives in in-memory maps; dev persistence is gitignored JSON. **Cross-session memory, save/share, and team workspaces are off the table** without picking a storage substrate first.
-- **No write-back to Bloomreach.** The agents read via MCP; they don't push scenarios/segments/campaigns back. **One-click execution is off the table** — the recommendation is the artifact the analyst takes to Bloomreach themselves.
-- **Demo path is the reliable presentation path.** `?demo=cached` serves a committed snapshot (`lib/state/demo-*.json`) — **because live is rate-limited and token-revoked, the demo is the surface that gets shown.** This is a constraint on how the product is demonstrated, not a future limitation.
-
-## The discovery questions (what the repo cannot establish)
-
-Honesty requirement — these are real gaps:
-
-- **How many Bloomreach analysts experience the three-context loop as painful enough to want a tool?** The workflow is encoded in the repo; the **prevalence** of the pain is not. Discovery move: 5 conversations with marketers on Bloomreach Engagement before scaling the agent count.
-- **Does "show your work" actually beat "magic answer" for this persona?** The bet is yes — but the repo cannot prove a preference. Discovery move: A/B the same recommendation with and without the trace visible, see which one the analyst forwards to their stakeholder.
-- **Is the 90-day window the right window for the analyst persona, or just for this dataset's sparse tail?** The window is currently enforced for technical reasons (bogus swings on shorter windows). Whether a marketer would want 30 / 60 / 90 / 180 as a user-controllable knob is unknown.
-
-A brief that pretends the repo answers these is a brief that loses credibility. Naming them is the move.
-
-## The sharp answer
-
-If the reviewer asks "in one sentence, what's the problem you're solving" — **"A marketer on Bloomreach Engagement currently runs a three-tool, three-context loop by hand to go from 'something moved' to 'here's what I'm doing about it' — and at the end of it, they have a recommendation but no visible reasoning to defend it. We collapse the three steps into one continuous loop and make the reasoning itself the product surface."**
-
-The defensible move is showing the repo encodes that exact loop already — the stepper, the dual-agent split, the streaming trace as 1/3 of the main UI. The product is not a hypothesis; it's a built thing being defended.
+The interviewer bar for AI product work is *judgment*, not *invention*. This book is the receipts on judgment.

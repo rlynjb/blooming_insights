@@ -1,192 +1,227 @@
-# Chapter 05 — The close + the ask (8:45–9:30, 45 seconds)
+# Chapter 05 — The close (8:45–9:30, 45 seconds)
 
-You have 45 seconds and one job: end on a beat, not a trail-off. The room has just heard the build story. They are about to clap or to ask a question. What happens in the next 45 seconds decides which sentence they carry into the hallway. Plan that sentence. Say that sentence. Stop.
+You have 45 seconds. The demo landed, the technical beat earned trust, the build story proved receipts. The room is ready to move on — the last thing they need from you is a beat that gives them the sentence to repeat to each other, the ask that names what happens next, and a clean stop before the buffer.
 
-The failure mode you are training against is the soft landing — "yeah, so, that's basically it, um, happy to take any questions." That ending erases everything the demo earned. The strong close has three beats: **where it goes next** (named as future, never demoed as if it exists), **what you want from the room** (the ask — specific, concrete), and **the last line** (the one they repeat to each other). Then silence.
+The single most common close failure: trailing off. "Yeah, so, that's kind of it, um, thanks?" is the sound of a demo losing the last thirty seconds it just spent five minutes earning. You are going to end on a beat.
+
+Three beats: **what's next** (clearly framed as future — never demoed as if it exists), **the ask** (what you want from the room), and **the last line** (the one sentence you want them repeating).
 
   ## The time-budget bar
 
-```
-  ┌────────────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░░░ │
-  │ 0:00 ─────────────────── 8:45 ── 9:30 ──────────────── 10:00   │
-  │           THE CLOSE — you own 8:45 to 9:30 (45 seconds)        │
-  │                       buffer 9:30 to 10:00 (30 seconds)        │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-45 seconds. Three beats. Then silence. The buffer after is not extra demo time — it's room for the applause beat to land before Q&A begins.
-
-  ## The chapter-opening diagram — the three-beat close
+  You own 45 seconds, then a 30-second buffer before the ten-minute mark. The buffer is real — do not eat it.
 
 ```
-  THE CLOSE — THREE BEATS, THEN STOP
-
-  8:45     ┌──────────────────────────────────────────────────┐
-           │  BEAT 1 — VISION (where it goes next)            │
-           │  "Next: the eval pipeline rebuilt against        │
-           │   synthetic, and a notification path so the      │
-           │   feed pushes you when something matters."       │
-           │  ~15 seconds. Future, not present.               │
-  9:00     ├──────────────────────────────────────────────────┤
-           │  BEAT 2 — THE ASK                                │
-           │  "What I want from this room: try it on your     │
-           │   own workspace this weekend. The repo is public │
-           │   and the synthetic mode runs without any setup."│
-           │  ~15 seconds. Concrete and specific.             │
-  9:15     ├──────────────────────────────────────────────────┤
-           │  BEAT 3 — THE LAST LINE                          │
-           │  "An analyst that shows its work."               │
-           │  5 words. Pause. Stop.                           │
-  9:30     └──────────────────────────────────────────────────┘
-                              │
-                              ▼
-                       silence + buffer
-                       (do not fill it)
+  ┌──────────────────────────────────────────────────────────┐
+  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░  │
+  │ 0:00 ── 1:00 ─────────────── 6:00 ─ 8:00 8:45 9:30 ─ 10:00 │
+  │        THE CLOSE — you own 8:45 to 9:30 (45 seconds)       │
+  │                          buffer 9:30–10:00 (30 seconds)    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Three beats, descending in length. The last line is the shortest one. That's the design.
+  ## The three beats
 
-  ## Beat 1 — The vision (8:45–9:00, 15 seconds)
-
-This is where you tell the room what's next. The rule from chapter 04 still holds: **never demo as if it exists.** Frame it explicitly as future. Two things to name, both anchored to what's actually in the roadmap of this codebase:
-
-| BEAT                                                              | SAY (out loud)                                              |
-|-------------------------------------------------------------------|-------------------------------------------------------------|
-| stand still, look at the room, don't touch the laptop             | "next: I rebuild the eval pipeline against the synthetic substrate — same four pillars, decoupled from any one data source — so the agents get scored on every change." |
-| (continued)                                                       | "and a notification path on top of the monitoring agent, so the feed doesn't just sit there waiting to be opened — it pushes you when something matters." |
-
-Two future capabilities. Both grounded — the eval is the rough edge you named in chapter 04, the notification path is a natural extension of the monitoring agent the room just watched. Neither is mocked up on screen. You are not selling vapor.
-
-  ## Beat 2 — The ask (9:00–9:15, 15 seconds)
-
-What do you want from the room? Be specific. "Feedback" is not an ask. "Try it on your own workspace this weekend" is an ask.
+  Not a diagram this time. A shape — a curve. This is what your close looks like on the attention curve.
 
 ```
-  ┃ "What I want from this room: try it on your own workspace
-  ┃  this weekend. The repo is public, and the synthetic mode
-  ┃  runs without any setup — no Bloomreach account, no OAuth,
-  ┃  no creds. Clone, npm install, npm run dev. That's it."
+  The close — three beats, one climb
+
+    high  │                                          ▲
+          │                                        ╱
+          │                       what's         ╱  the ask
+  mid     │                        next    ▲   ╱     lands
+          │                                 ╲╱
+          │                                                 ▲
+          │                                                ╱ ← last line
+  low     ├───────────────────────────────────────────────╯   lands
+          │
+          └────────────────────────────────────────────────
+              8:45         9:00          9:15          9:30
+              ▲            ▲             ▲             ▲
+              open the     future        ask           mic drop
+              close        state         one thing     one line
+              beat         (10s)         (10s)         (5s)
 ```
 
-The reason this ask works: it is **frictionless to act on**. The room does not need a Bloomreach account to try the product, because you built `live-synthetic` exactly for this kind of moment. You are not asking them to sign up for a beta — you are asking them to clone a repo and run a command. That's the kind of ask people actually do.
+  Notice the shape: the first two beats sit at mid attention because you're setting up the punch; the last line spikes. Do not deliver the last line at low energy.
 
-If the hackathon has a voting mechanism, **add one sentence after the ask:**
+  ## Beat 1 — what's next (8:45–9:00)
 
-```
-  ┃ "And if you liked what you saw, [voting URL / vote for
-  ┃  table 7 / hit the green button at the bottom of your card]."
-```
+  Where the project goes from here. Clearly framed as future — never demoed as if it exists. Two things to name, and stop. Do not list five directions; a hackathon close that promises everything sounds like a hackathon close that shipped nothing.
 
-Don't bury the vote ask. If it exists, it gets its own sentence.
+  The two things worth naming:
 
-  ## Beat 3 — The last line (9:15–9:30, ~5 seconds + silence)
+  → **A blind human calibration pass** on the eval flywheel — Chapter 06 has the full answer, but the seed goes here. You already have the worksheet; the pass is 30-60 minutes of a human rater going through blind. That gives you the interview-defensible number.
 
-The five-word callback to the tag from the cold open. This is the third planting; the room has now heard it three times — cold open, money shot, close. The third hearing is the one that sticks.
+  → **The next mode** — `live-bloomreach` with fresh tokens. The synthetic path is the demo path because it's reliable; the Bloomreach path is the production path, and it's already built. What ships next is a smoother OAuth reconnect flow when the alpha server revokes tokens.
 
 ```
-  ┃ "An analyst that shows its work."
+  SHOW (on screen)                    SAY (out loud)
+  ────────────────────────            ──────────────────────────
+  return to browser feed              "what's next — two things.
+  page (a familiar picture             a blind human calibration
+  from the money shot)                 pass on the eval to give me
+                                       an interview-defensible
+                                       number. and a smoother OAuth
+                                       reconnect when the alpha
+                                       server revokes tokens mid-
+                                       session."
+  ────────────────────────            ──────────────────────────
 ```
 
-Then **stop talking.** Look at the room for two seconds. Let it land. Do not fill the silence with "yeah," "thanks," "happy to take questions," or "that's it." The pause is the punctuation. Q&A will start when the host moves it forward.
+  Notice what's *not* in that list: "productionize," "scale," "add more agents." Those would collapse the moment a judge asked "what does that actually mean." Two things, both concrete, both anchored to work you can start Monday.
 
-  ## Strong vs. weak — the closing move
+  ## Beat 2 — the ask (9:00–9:15)
+
+  This is the sentence that names what you want from the room. Judges in a hackathon are used to hearing "please vote for us." That's the weak version. You have a stronger one.
+
+  The strong ask is specific and singular: **one conversation**. You want to talk to someone who runs analytics on a Bloomreach workspace and would use this as a daily tool. Not a hundred votes, not a demo signup, not "check out our repo." One right conversation.
 
 ```
-  WEAK CLOSE                              STRONG CLOSE
-  ────────────────────────────────        ───────────────────────────────
-  "so yeah, that's blooming               "next: eval pipeline rebuilt
-   insights. there's a bunch of            against synthetic, and a
-   stuff I want to do next, like           notification path on the
-   maybe build out the eval                monitoring agent."
-   pipeline again, maybe add               (15s — future, not present)
-   notifications, and I'd love
-   feedback. the repo's online             "try it on your own workspace
-   if you want to check it out.            this weekend. synthetic mode
-   um. happy to take questions."           runs without any setup."
-                                           (15s — concrete ask)
-  → no beat, no last line
-  → fizzles to "um"                        "an analyst that shows its
-  → no specific ask                         work."
-  → room forgets the tag                   (silence)
-                                           → three beats, descending
-                                           → last line plants the tag
-                                             for the third time
-                                           → silence does the work
+  SHOW (on screen)                    SAY (out loud)
+  ────────────────────────            ──────────────────────────
+  (still on feed page)                "what i want from this room —
+                                       one conversation. if you run
+                                       analytics on a Bloomreach
+                                       workspace, or you know
+                                       someone who does, find me
+                                       after. that's the ask."
+  ────────────────────────            ──────────────────────────
 ```
 
-The weak close erases the demo. The strong close cements it.
+  ┃ "One conversation. If you run analytics on a Bloomreach workspace, find me after."
 
-  ## The IF-IT-BREAKS box
+  ## Beat 3 — the last line (9:15–9:30)
 
-╔══════════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                                       ║
-║ You went long in chapters 02–04 and you are at 9:30 already.       ║
-║                                                                    ║
-║ → CUT BEAT 1 (the vision). Go straight to the ask, then the        ║
-║   last line. The ask + last line is the irreducible close — 20     ║
-║   seconds, complete.                                               ║
-║ → DO NOT skip the last line to save time. The last line is the     ║
-║   only beat in the chapter that's irreplaceable.                   ║
-║                                                                    ║
-║ Different fail: you blank on the last line under stage stress.     ║
-║ → Default to the long version of the tag: "blooming insights is    ║
-║   an analyst that shows its work." Same callback, slightly more    ║
-║   words. The room cannot tell the difference.                      ║
-╚══════════════════════════════════════════════════════════════════╝
+  This is the sentence they repeat to each other in the ten seconds before the next demo starts. It has to be short. It has to be memorable. It has to close the loop with the cold open.
+
+  The cold open said "this is my agent doing that live." The last line closes it:
+
+  ┃ "An analyst that shows its work — end to end, in the browser you already have open."
+
+  Then you stop. You do not say "thank you" — the beat is stronger without it. You look at the room, you hold for one count, and you sit down (or step back from the mic). That silence is the mic drop.
+
+  ## Strong vs weak — the trail-off failure mode
+
+  This is the classic close failure. Every judge has watched it. Do not do it.
+
+```
+  ┌── weak (do not) ───────────────┬── strong (do this) ────────────┐
+  │                                 │                                 │
+  │ "yeah, so, that's blooming      │ "one conversation. if you run   │
+  │  insights. we could definitely  │  analytics on a Bloomreach       │
+  │  add more agents, and we're     │  workspace, find me after."     │
+  │  thinking about production, and │                                 │
+  │  maybe multi-tenant, and — um,  │ (one beat)                       │
+  │  yeah. thanks?"                 │                                 │
+  │                                 │ "an analyst that shows its       │
+  │  25 seconds of trailing         │  work — end to end, in the       │
+  │  attention drops off a cliff    │  browser you already have open." │
+  │  before the "thanks" lands      │                                 │
+  │                                 │ (hold, step back)                │
+  │                                 │                                 │
+  │                                 │  25 seconds of climbing         │
+  │                                 │  attention curve peaks on the   │
+  │                                 │  last line and holds through    │
+  │                                 │  the silence                    │
+  │                                 │                                 │
+  └─────────────────────────────────┴─────────────────────────────────┘
+```
+
+  Two rules for the close: no "so, yeah." No "um, thanks." The beat is stronger with silence than with a courtesy.
+
+  ## IF IT BREAKS — the no-browser backup
+
+  This chapter has one on-screen anchor — returning to the feed page. If localhost is dead by minute nine (it happens), the fallback is a black slide with the last-line text.
+
+```
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║ IF IT BREAKS                                                       ║
+  ║                                                                    ║
+  ║ Localhost is dead / browser tab lost:                              ║
+  ║   → cut to a black slide with the last-line text pre-rendered      ║
+  ║   → deliver Beat 1 and Beat 2 without a screen anchor              ║
+  ║   → close on the last-line slide — the text on screen carries the  ║
+  ║      beat while your voice delivers it                             ║
+  ║                                                                    ║
+  ║ No slide backup available:                                         ║
+  ║   → deliver all three beats verbally, no screen                    ║
+  ║   → look at the room, not at the dead screen                       ║
+  ║   → the last line lands the same way regardless of the picture     ║
+  ║                                                                    ║
+  ╚══════════════════════════════════════════════════════════════════╝
+```
 
   ## The "tighten it" cut
 
-The cut order, in priority — drop from the top first:
+  If the whole slot ran long and you enter this chapter at 8:55 instead of 8:45, cut here first.
 
 ```
-  CUT 1ST   →   the second sentence of Beat 1 (the notifications)
-                "next: eval pipeline rebuilt against synthetic."
-                One future capability is still a future. Two is
-                a roadmap.
+  Running long — drop these beats, in this order:
 
-  CUT 2ND   →   Beat 1 entirely. Go ask → last line.
-                Floor: 20 seconds.
+    1. drop Beat 1 (what's next) entirely
+       skip straight from Chapter 04's handoff to Beat 2 (the ask)
+       cost: 15 seconds saved. the ask and the last line still land.
 
-  CUT 3RD   →   the hackathon-voting sentence in Beat 2, if it
-                exists. The ask is enough; the vote is a bonus.
+    2. drop the specificity in Beat 2
+       "one conversation — find me after" instead of the full
+       Bloomreach analytics framing
+       cost: 5 seconds saved. weaker but still ends on a beat.
 
-  DO NOT CUT →  the last line. Ever. If you have one breath left
-                to use, use it on five words.
+  Floor:
+    → the last line. always deliver the last line verbatim.
+      "an analyst that shows its work — end to end, in the
+      browser you already have open." this is non-negotiable.
+      even if the buzzer starts, say the last line, then sit
+      down. never trail off.
 ```
 
-Floor for the chapter: **the last line is said and you stop.** Everything above it is cuttable. The last line and the silence after are not.
+  ## One-page run sheet — the close
 
-  ## The one-page run sheet — the close
+  This is what you hold on stage during the 45-second close.
 
 ```
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ RUN SHEET — 05 THE CLOSE                  8:45–9:30 (45 seconds) │
-  │                                                                  │
-  │ STATE BEFORE: stand still. Hands off the laptop.                 │
-  │               Look at the room.                                  │
-  │                                                                  │
-  │ 8:45–9:00  BEAT 1 — VISION (15 seconds, future tense)            │
-  │             "next: the eval pipeline rebuilt against synthetic   │
-  │              — same four pillars, decoupled from any one data    │
-  │              source — so the agents get scored on every change." │
-  │             "and a notification path on the monitoring agent,    │
-  │              so the feed pushes you when something matters."     │
-  │                                                                  │
-  │ 9:00–9:15  BEAT 2 — THE ASK (15 seconds, concrete)               │
-  │             "what I want from this room: try it on your own      │
-  │              workspace this weekend. the repo is public, and     │
-  │              synthetic mode runs without any setup — no          │
-  │              Bloomreach account, no OAuth, no creds. clone,      │
-  │              npm install, npm run dev. that's it."               │
-  │             [if hackathon voting exists, add one sentence]       │
-  │                                                                  │
-  │ 9:15–9:30  BEAT 3 — THE LAST LINE                                │
-  │             "an analyst that shows its work."                    │
-  │             → STOP TALKING. Look at the room. Let it land.       │
-  │                                                                  │
-  │ NAIL THIS:  the last line. Five words. Then silence.             │
-  │ IF BREAKS:  cut Beat 1. Ask + last line is the floor.            │
-  │ TIGHTEN:    drop the second sentence of Beat 1 first.            │
-  ╰──────────────────────────────────────────────────────────────────╯
+  ╭─ RUN SHEET · CHAPTER 05 · THE CLOSE ─────────────────────╮
+  │                                                           │
+  │  Budget:     8:45–9:30 (45 seconds)                       │
+  │  Buffer:     9:30–10:00 (30 seconds — do not eat)         │
+  │                                                           │
+  │  Pre-flight:                                              │
+  │    → localhost feed page still open in tab                │
+  │    → black last-line slide ready in second window         │
+  │                                                           │
+  │  Beats:                                                   │
+  │    8:45  back to browser feed page                        │
+  │    8:45  "what's next — two things"                       │
+  │           → blind calibration pass on the eval            │
+  │           → smoother OAuth reconnect for                  │
+  │             live-bloomreach                                │
+  │    9:00  the ask: "one conversation. if you run           │
+  │           analytics on a Bloomreach workspace, find       │
+  │           me after."                                      │
+  │    9:15  the last line:                                   │
+  │           "an analyst that shows its work — end to        │
+  │            end, in the browser you already have open."    │
+  │    9:20  hold one count                                   │
+  │    9:25  step back from the mic; silence to 9:30          │
+  │                                                           │
+  │  The two lines to nail (verbatim):                        │
+  │    → "one conversation. if you run analytics on a         │
+  │       Bloomreach workspace, find me after."               │
+  │    → "an analyst that shows its work — end to end,        │
+  │       in the browser you already have open."              │
+  │                                                           │
+  │  IF IT BREAKS:                                            │
+  │    → localhost dead → last-line slide + verbal beats      │
+  │    → no slide → verbal only, eyes on the room             │
+  │                                                           │
+  │  Tighten-it:                                              │
+  │    1. drop "what's next" beat (−15s)                      │
+  │    2. shorten the ask (−5s)                               │
+  │                                                           │
+  │  Floor:                                                   │
+  │    → deliver the last line verbatim. never trail off.     │
+  │    → no "so, yeah." no "um, thanks."                      │
+  │                                                           │
+  ╰──────────────────────────────────────────────────────────╯
 ```

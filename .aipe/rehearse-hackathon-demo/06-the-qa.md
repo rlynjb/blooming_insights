@@ -1,332 +1,261 @@
-# Chapter 06 — The Q&A (post-clock — prep, no budget)
+# Chapter 06 — The Q&A (after the clock, prep only)
 
-This chapter does not eat your ten minutes. It runs after the timed slot. But it is the chapter that decides whether the judges walk away thinking "real engineering" or "AI-built mockup." The room saw the demo for five minutes. They will spend three to ten minutes asking you about it. Those questions are the second half of your scorecard.
+The buzzer went off. The room is polite-clapping. A judge raises a hand. This is the chapter that runs after the ten-minute slot and never eats it — but it's the chapter that decides whether the demo lands with a "nice work" or a business card.
 
-The pattern judges use in 2026 is well-known: they assume heavy AI assistance in the build (correctly), and they probe to find out whether you understand what you shipped. Defensive answers — "I really did write most of it myself" — score worse than matter-of-fact answers — "I used Claude heavily for the agent loop refactor; here's the boundary I drew and here's what I decided." The job of this chapter is to train you for that posture: own the tools, own the decisions, own the rough edges, and have a crisp speakable answer ready for every probe you can predict.
+The Q&A rules are different from the demo. In the demo you were choreographing a room; here you're one-on-one with a judge who has one probe and about 45 seconds of patience. The answers are short. They point at receipts. They own the rough edges. They never hedge.
 
-The five probes the room will almost certainly ask, plus the harder ones the experienced judges will. Each answer is in your voice, first person, present tense, speakable on the spot.
+Six probes come up almost every time. You rehearse the verbatim answer to each. When a variant of a probe lands, you recognize the shape and use the answer. If a probe is genuinely off-script, you have a fallback move: "the honest answer is I don't know — here's what I'd need to find out." That answer beats a fabricated one, always.
 
-  ## The Q&A map — the questions in priority order
+  ## The Q&A shape — six anticipated probes
 
-```
-  ┌────────────────────────────────────────────────────────────────┐
-  │                  Q&A — LIKELY → LESS LIKELY                     │
-  │                                                                 │
-  │  TIER 1 — almost certain (prep these cold)                      │
-  │    Q1  "Is this actually working, or is it a mockup?"           │
-  │    Q2  "What was the hard part?"                                │
-  │    Q3  "What's the stack?"                                      │
-  │    Q4  "Did you build this during the hackathon?" (AI-usage)    │
-  │    Q5  "Is there a business here / what's next?"                │
-  │                                                                 │
-  │  TIER 2 — experienced judges (prep these warm)                  │
-  │    Q6  "Why a library for the loop instead of writing your own?"│
-  │    Q7  "Isn't synthetic just fake data?"                        │
-  │    Q8  "You built an eval pipeline and then deleted it?"        │
-  │    Q9  "What's the production deployment story?"                │
-  │                                                                 │
-  │  TIER 3 — adversarial / weird (prep one liner each)             │
-  │    Q10 "Why Bloomreach?"                                        │
-  │    Q11 "Couldn't a marketer just ask ChatGPT?"                  │
-  │    Q12 "What stops the agent from hallucinating numbers?"       │
-  │    Q13 "How much does this cost per briefing?"                  │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-Below: each question, the crisp answer, and the most likely follow-up so you don't get walked into a corner.
-
-  ## Tier 1 — almost certain
-
-  ### Q1 — "Is this actually working, or is it a mockup?"
-
-This is the no-vaporware probe. The answer is short and specific:
+  Each probe has a category. Recognizing the category is 80% of answering well.
 
 ```
-  ┃ "Real. There are three modes — the toggle you saw in the
-  ┃  corner — `demo`, `live-synthetic`, and `live-bloomreach`.
-  ┃  All three run real agent code. Demo replays a committed
-  ┃  snapshot of a real run. Synthetic runs the agents in
-  ┃  process against deterministic ecommerce data. Bloomreach
-  ┃  runs against a real Bloomreach workspace over OAuth and
-  ┃  MCP. The thing on stage was synthetic — real Claude,
-  ┃  real agent loop, fake data."
+  The six probes — what judges ask after a hackathon demo
+
+  ┌── probe ──────────────────────┬── category ─────────────────┐
+  │ 1. isn't synthetic just fake?  │ credibility of the demo     │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 2. how do you know the eval    │ credibility of the receipts │
+  │    isn't measuring itself?     │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 3. what if i break a prompt?   │ regression story            │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 4. what's the production       │ deployment story            │
+  │    deployment story?           │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 5. what about scale?           │ scale honesty               │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 6. why NOT route monitoring    │ cost / model choice         │
+  │    to a cheaper model?         │                             │
+  └────────────────────────────────┴─────────────────────────────┘
 ```
 
-**Likely follow-up:** "Can I see the live-bloomreach one?"
-**Answer:** "Yes — but the Bloomreach alpha server revokes tokens after a few minutes, so I demo on synthetic for reliability. I can run it on Bloomreach after this if you want to see the OAuth flow and the rate-limiter."
+  ## Probe 1 — "isn't synthetic just fake data?"
 
-  ### Q2 — "What was the hard part?"
+  This is the credibility probe. A judge is checking whether the demo they just saw was real reasoning or a puppet show. The answer has two parts: name what's fake (the data, not the agent behavior), and produce a receipt that proves it.
 
-There is one good answer here and it is not "everything." Pick one and tell it tight.
+  ┃ "It's deterministic Blooming-owned synthetic ecommerce — purchase, view_item, session_start, cart_update events with realistic properties. Real Claude, real reasoning, in-process data. The fake is the data, not the agent behavior. And here's the fault injector receipt: 9 injected faults across 3 investigations, 0 failed. Seeded PRNG so you can replay it."
 
-```
-  ┃ "Building the eval pipeline. I had four agents and no
-  ┃  ground truth for what 'good' looked like — so I built a
-  ┃  4-pillar eval suite (detection, diagnosis, recommendation,
-  ┃  regression) with LLM-as-judge plus manual spot-check
-  ┃  calibration. It surfaced three real bugs the agents had:
-  ┃  one was a units bug where revenue came out as
-  ┃  R$131,965 because I was treating BRL cents as Reais; one
-  ┃  was a binary-calibration bug — the LLM judge was giving
-  ┃  29 out of 30 perfect scores; one was conclusion
-  ┃  instability — 30% of identical inputs produced
-  ┃  diverging conclusions. The eval finding the bugs was the
-  ┃  hard part. The bugs themselves were easy once I had a
-  ┃  scoreboard."
-```
+  The move: **name what's fake, produce the receipt**. The receipt is the fault-injection number — 9 faults injected across 3 investigations, 0 failed — because if the agent behavior were faked, injecting real errors wouldn't produce that outcome. The receipt closes the loop.
 
-**Likely follow-up:** "And you removed the eval pipeline?"
-**Bridge to Q8.**
-
-  ### Q3 — "What's the stack?"
-
-Short. Names. Move on.
+  Follow-up decision tree:
 
 ```
-  ┃ "Next.js 16 App Router on Vercel, React 19. TypeScript.
-  ┃  Anthropic SDK — claude-sonnet-4-6 for the agents,
-  ┃  claude-haiku-4-5 for intent classification. AptKit core
-  ┃  at 0.3.0 for the agent loop runtime. Model Context
-  ┃  Protocol over Streamable HTTP with OAuth PKCE for the
-  ┃  Bloomreach side. NDJSON over ReadableStream for the
-  ┃  trace streaming. Tailwind v4. Vitest — 24 test files,
-  ┃  221 passing. No database; state in memory, demo
-  ┃  snapshots committed as JSON."
+  If judge presses "but the DATA is fake, so results are meaningless" →
+    "The data is fake; the agent's reasoning process is what's under
+     test. When I run against the real Bloomreach workspace, the
+     agent uses the same reasoning process. What live-synthetic gives
+     me is a reproducible substrate to gate my prompts against."
+
+  If judge asks "why not just use real data" →
+    "Because real data is behind OAuth, rate-limited to ~1 req/s, and
+     the alpha server revokes tokens after minutes. Synthetic lets me
+     rehearse, run evals, and demo without waiting on that. Live mode
+     hits the real workspace when I need it to."
 ```
 
-**Likely follow-up:** "Why Sonnet and not Opus?"
-**Answer:** "Latency. The streaming trace is the differentiator, and Sonnet keeps the time-to-first-event short enough that the trace feels alive. Opus would feel like waiting."
+  ## Probe 2 — "how do you know the eval isn't measuring itself?"
 
-  ### Q4 — "Did you build this during the hackathon?" (the AI-usage probe)
+  This is the receipts-credibility probe. A judge is checking whether you've thought about circularity — the eval scoring itself against its own definition of correct. This one is answered by owning the rough edge.
 
-This is the test for posture. Matter-of-fact. Own it.
+  ┃ "Blind calibration protocol. Session D was AI-vs-AI, stamped `pilotWarning` in the receipt because I know it's not real calibration. The interview-defensible number needs a blind human pass — 30-60 minutes, worksheet already generated. That's the honest answer."
 
-```
-  ┃ "I used Claude heavily — the agent prompts, the data
-  ┃  source adapter, big chunks of the route handlers, most
-  ┃  of the test scaffolding. What I decided: the 4-agent
-  ┃  decomposition, the DataSource seam, that the trace had
-  ┃  to be the differentiator, that the eval would be 4
-  ┃  pillars not 2, and that the loop should migrate from
-  ┃  hand-rolled to library after I proved the shape worked.
-  ┃  The model wrote a lot of code. I wrote the architecture
-  ┃  and the judgments."
-```
+  The move: **own the rough edge, name the next step**. Do not pretend the AI-vs-AI pilot is calibration. The judge is asking whether you understand the difference between measurement and self-measurement, and the answer is yes — and here's how you close the gap.
 
-**Likely follow-up:** "How long did it take?"
-**Answer:** Pick a real number you can defend; do not round up.
-
-  ### Q5 — "Is there a business here? / What's next?"
+  Follow-up decision tree:
 
 ```
-  ┃ "The business model is the same as every analytics-on-top
-  ┃  of-platform-X product — Bloomreach has marketers who
-  ┃  spend hours staring at dashboards, and the agent loop
-  ┃  collapses that into a five-minute morning read. Next is
-  ┃  rebuilding the eval against synthetic, adding a
-  ┃  notification path on the monitoring agent so the feed
-  ┃  pushes you, and broadening past Bloomreach — the
-  ┃  DataSource seam is exactly what would let me adapt to a
-  ┃  second platform."
+  If judge asks "so your numbers are AI-scored?" →
+    "For the pilot session, yes. That's why they're stamped
+     pilotWarning. The rubrics are grounded — 2 rubrics, 4 dimensions,
+     5-point scale — and the baseline is committed. The next pass
+     needs a human rater. Worksheet is at eval/calibration/."
+
+  If judge asks "how would you rate it yourself" →
+    "I'd expect the diagnosis rubric to hold up better than the
+     recommendation rubric under blind human review. Diagnosis is
+     more mechanical — evidence, scope, hypothesis. Recommendation
+     is judgment-heavy, so drift is more likely."
 ```
 
-**Likely follow-up:** "Who pays for it?"
-**Answer:** "Marketers / growth teams on Bloomreach. The pitch is 'replace the dashboard-staring hour with a five-minute briefing.' Per-seat SaaS is the natural shape; I haven't priced it."
+  ## Probe 3 — "what if i break a prompt?"
 
-  ## Tier 2 — experienced judges
+  This is the regression probe. A judge is checking whether the eval is decorative or load-bearing. Load-bearing means it gates.
 
-  ### Q6 — "Why a library for the loop instead of writing your own?"
+  ┃ "npm run eval:gate. Blocks the PR if any dimension regressed more than 10pp. Baseline is committed at eval/baseline.json. Watch — here's the self-check: baseline vs baseline all deltas +0pp, gate passes. Now if I go to eval/rubrics/diagnosis-quality.ts and lower a score threshold, gate goes red."
 
-```
-  ┃ "I built it first. The hand-rolled loop is still in the
-  ┃  repo at base-legacy.ts as a rollback receipt. Once
-  ┃  @aptkit/core had a clean generic-primitive surface, the
-  ┃  migration was 3 adapter classes — about 200 lines. The
-  ┃  library owns the loop; I own the boundary. That's the
-  ┃  trade I want: deep code I author lives at the boundary,
-  ┃  not in the loop itself."
-```
+  The move: **demonstrate it, don't just describe it**. If you're near a terminal, run the self-check. If not, name exactly what the output looks like. "Gate passes" and "gate goes red" are concrete phrases judges can hold onto.
 
-**Likely follow-up:** "What if AptKit goes away?"
-**Answer:** "Roll back to base-legacy.ts. It's not deleted, it's preserved. That's why."
-
-  ### Q7 — "Isn't synthetic just fake data?"
-
-This is the question that tests whether you understand what synthetic mode is *for*. Don't get defensive.
+  Follow-up decision tree:
 
 ```
-  ┃ "The data is fake — purchase, view_item, session_start,
-  ┃  cart_update events with realistic properties, owned by
-  ┃  the app. The behavior is real: real Claude, real
-  ┃  4-agent loop, real streaming trace, real EQL-shaped
-  ┃  queries executed against in-process tables. What
-  ┃  synthetic lets me do is run the agent loop live for a
-  ┃  judge without depending on Bloomreach being up or
-  ┃  having an OAuth token. The fake is the data, not the
-  ┃  agent behavior. That's exactly what a demo needs."
+  If judge asks "is that wired into CI?" →
+    "Yes. .github/workflows/eval.yml runs on PR. Any dim regressed
+     more than 10pp blocks the merge. That's the shipped state."
+
+  If judge asks "10pp is a lot — why not 5?" →
+    "10pp is the honest signal-to-noise threshold at 10 goldens.
+     With more goldens the threshold tightens. It's a tunable — the
+     number is not the point; the gate is."
 ```
 
-**Likely follow-up:** "But you don't know it works on real data."
-**Answer:** "It runs on real data in `live-bloomreach` mode against a real Bloomreach workspace. Synthetic is the demo-day path; Bloomreach is the production path. I can flip the toggle and show you."
+  ## Probe 4 — "what's the production deployment story?"
 
-  ### Q8 — "You built an eval pipeline and then deleted it?"
+  This is the deployment probe. A judge is checking whether "demo" and "shippable" are the same thing.
 
-This is the question that decides whether the chapter-04 arc reads as senior or as messy. The answer is the strongest single anecdote in your interview kit.
+  ┃ "Demo is the default for reliability. Live-bloomreach when there's a real workspace plus OAuth tokens. Live-synthetic is the dev / test / judge-friendly path — no creds, no upstream dependency. Deployed to Vercel Pro; maxDuration 300 on the streaming routes. Auto-reconnect when the alpha server revokes tokens mid-session."
 
-```
-  ┃ "Built it, used it to surface three real bugs — the BRL
-  ┃  units bug, the binary-calibration bug, the conclusion
-  ┃  instability — and retired it together with the data
-  ┃  substrate it scored against. The substrate was Olist
-  ┃  ecommerce data over a SQLite MCP server I owned; I
-  ┃  retired that substrate in favor of the Blooming-owned
-  ┃  synthetic shape, which is cleaner. The eval went with
-  ┃  it. The rebuild target is against synthetic, decoupled
-  ┃  from any one adapter's seed data. The receipt of
-  ┃  having shipped the eval once, and the three bugs it
-  ┃  caught, are stronger than promising to build it. That's
-  ┃  what's in the close as next."
-```
+  The move: **name the three modes and what each is for**. The judge is expecting a hedge; instead, name the specific runtime posture for each mode.
 
-**Likely follow-up:** "Wouldn't it have been safer to keep the eval?"
-**Answer:** "It would have been safer. It would also have meant carrying a substrate I no longer wanted, just so the scoring still worked. The right shape is eval-against-synthetic. The cost is the gap until I rebuild it. I'm naming the gap, not hiding it."
-
-  ### Q9 — "What's the production deployment story?"
+  Follow-up decision tree:
 
 ```
-  ┃ "Demo as default for reliability — the committed snapshot
-  ┃  serves instantly with no auth. live-bloomreach when
-  ┃  there's a real workspace and OAuth tokens. live-
-  ┃  synthetic is the dev/test/judge-friendly path. Vercel
-  ┃  Pro for the agent routes — maxDuration 300 because
-  ┃  Bloomreach is rate-limited to ~1 req/s and a briefing
-  ┃  can take a couple of minutes end to end. Auth is
-  ┃  AES-256-GCM-encrypted cookies in production, file-based
-  ┃  store in dev. The alpha Bloomreach server revokes
-  ┃  tokens after minutes — the feed has auto-reconnect on
-  ┃  invalid_token to handle it."
+  If judge asks "what happens when the token dies mid-session?" →
+    "The route catches invalid_token errors, resets auth via
+     /api/mcp/reset, and reloads the page once (guarded flag to
+     prevent loops). The UX is a reconnect button on error panels."
+
+  If judge asks "is state persisted?" →
+    "In-memory maps in production; gitignored JSON files in dev.
+     Demo snapshots are committed to lib/state/demo-*.json — that's
+     the reliable-demo path. No database."
 ```
 
-**Likely follow-up:** "How do you scale past one user?"
-**Answer:** "Session ID per user, OAuth tokens per session, in-memory caches per session. The agent loop is stateless across requests — each briefing fetches fresh from Bloomreach. The scaling question is really 'how many Bloomreach tool calls per minute can you sustain' and that's an alpha-server problem, not an architecture problem."
+  ## Probe 5 — "what about scale?"
 
-  ## Tier 3 — adversarial / weird
+  This is the scale-honesty probe. A judge is checking whether you overclaim. Do not.
 
-  ### Q10 — "Why Bloomreach?"
+  ┃ "The bottleneck is browser session state on a warm Vercel instance. Trigger for revisit: multi-instance. Load harness at N=20, K=3 is roughly 28 minutes wall clock estimated — I smoke-tested at N=2, K=1 which took 208 seconds. Real p99 numbers need a real load run at production scale. That's honest."
 
-```
-  ┃ "It's where the marketer already is. There's a real MCP
-  ┃  surface — execute_analytics_eql, the EQL query language,
-  ┃  the segment and campaign APIs — which means I can act
-  ┃  on the diagnosis, not just describe it. The
-  ┃  recommendation agent proposes scenarios, vouchers,
-  ┃  campaigns — those are Bloomreach primitives. The
-  ┃  product is Bloomreach-specific on purpose."
-```
+  The move: **name the bottleneck, name the trigger, name what you've measured and what you haven't**. "Real p99 numbers need a real load run" is the sentence that separates senior signal from junior overclaim.
 
-  ### Q11 — "Couldn't a marketer just ask ChatGPT?"
+  Follow-up decision tree:
 
 ```
-  ┃ "ChatGPT doesn't have tool access to the workspace. The
-  ┃  whole loop here is grounded — every conclusion cites
-  ┃  the exact EQL query that produced it and the current-vs-
-  ┃  prior numbers behind it. You can't get that from a
-  ┃  general chatbot. The streaming trace is the proof."
+  If judge asks "why haven't you run one?" →
+    "Cost. Full load at N=20 costs about $26 in Claude tokens and
+     takes half an hour of wall clock. Worth doing when there's a
+     production trigger. Not worth doing to have a number for a
+     demo."
+
+  If judge asks "what's the horizontal scale story?" →
+    "It's not built yet. Session state lives in memory; multi-
+     instance would need shared state (Redis or a DB). The MCP
+     server rate-limits at ~1 req/s per workspace, so per-workspace
+     concurrency is capped upstream regardless."
 ```
 
-  ### Q12 — "What stops the agent from hallucinating numbers?"
+  ## Probe 6 — "why NOT route monitoring to Haiku?"
+
+  This is the cost-choice probe. A judge is checking whether you make cost decisions with data or with vibes.
+
+  ┃ "The eval doesn't measure monitoring cost — it skips monitoring and feeds golden anomalies straight to DiagnosticAgent. Routing to Haiku blind would be the exact anti-pattern the eval flywheel exists to prevent. Deferred until we have production data. That's the receipt of a decision, not procrastination."
+
+  The move: **explain what the eval measures and doesn't, then explain what would justify the change**. This is the answer that shows you understand the difference between "cheaper" and "cheaper without regressing quality."
+
+  Follow-up decision tree:
 
 ```
-  ┃ "Every number in the UI is sourced from a tool call. The
-  ┃  Insight type carries an evidence array of {tool, result}
-  ┃  pairs, and the UI renders the prior→now comparison from
-  ┃  that evidence. If the agent makes a number up, there's
-  ┃  no evidence entry — and the UI shows a `--` placeholder
-  ┃  instead of a fabricated value. Hallucinated narrative is
-  ┃  still possible. Hallucinated numbers are caught at the
-  ┃  render layer."
+  If judge asks "isn't that expensive?" →
+    "About nine cents per case per full investigation. The intent
+     classifier is already on Haiku — that's the cheap first hop.
+     The reasoning agents are on Sonnet because that's where the
+     accuracy shows up in the eval."
+
+  If judge asks "what would flip you to Haiku?" →
+    "Golden cases running through monitoring in the eval, so I can
+     compare Sonnet-monitoring vs Haiku-monitoring on the same
+     dimensions. Right now the eval starts at diagnosis. Adding
+     that layer is on the roadmap."
 ```
 
-  ### Q13 — "How much does this cost per briefing?"
+  ## The off-script fallback — the "i don't know" move
+
+  When a probe genuinely surprises you, do not fabricate. The strongest recovery move in a hackathon Q&A is naming the gap honestly.
 
 ```
-  ┃ "Haven't measured precisely. The monitoring agent does
-  ┃  maybe 6 to 10 tool calls and a similar number of model
-  ┃  turns on Sonnet, so ballpark a few cents. The
-  ┃  recommendation agent is shorter. Bloomreach side is
-  ┃  free — rate-limited but not metered. Order of magnitude:
-  ┃  a daily briefing per user costs less than the API
-  ┃  charges for the marketer's expense-report tool."
+  ┌── weak (do not) ───────────────┬── strong (do this) ────────────┐
+  │                                 │                                 │
+  │ judge: "how does your rate      │ judge: "how does your rate      │
+  │  limiter handle burst traffic?" │  limiter handle burst traffic?" │
+  │                                 │                                 │
+  │ "so it's basically a token      │ "the honest answer is i don't   │
+  │  bucket, and it kind of…        │  know off the top of my head —  │
+  │  buffers requests, and…"        │  the client is at lib/mcp/      │
+  │                                 │  client.ts, and it's roughly    │
+  │ (fabricated; a follow-up will   │  one request per second with     │
+  │  expose it)                     │  a retry. what specifically      │
+  │                                 │  are you asking about — burst    │
+  │                                 │  handling or fairness?"          │
+  │                                 │                                 │
+  └─────────────────────────────────┴─────────────────────────────────┘
 ```
 
-  ## Postures to hold across all answers
+  Three moves for off-script probes:
+
+  → **Name the file/module the answer lives in.** Judges respect specificity even when the answer isn't complete.
+
+  → **Ask a clarifying question back.** Turns the probe into a conversation instead of an exam.
+
+  → **Never speculate past what you actually know.** A fabricated technical answer costs more trust than an honest "I don't know" ever will.
+
+  ## On owning AI-assisted development
+
+  Judges in 2026 assume heavy AI use in a hackathon build. Defensiveness reads worse than candor. If the question comes up:
+
+  ┃ "AI-assisted, absolutely. I use Claude Code as a pair programmer — the agent loop, the DataSource seam, the eval flywheel, all shipped with heavy AI assistance. What I own: the architecture decisions, the seam choice, the eval design, the retirement of the wrong substrate in phase 3. What the tools did: a lot of the typing. Both matter."
+
+  The move: **name what you own and what the tools did, without flinching**. This is the sentence that separates someone who used AI to ship from someone who used AI to hide.
+
+  ## One-page run sheet — the Q&A
+
+  This is what you glance at before the Q&A session starts, not during. During the Q&A, your eyes are on the judge.
 
 ```
-  ┌────────────────────────────────────────────────────────────────┐
-  │ POSTURE                          INSTEAD OF                     │
-  │ ────────────────────────────     ─────────────────────────────  │
-  │ "I used Claude heavily for X"    "I really did write it myself" │
-  │ "Real, on path Y. Here's the     "It's a working demo, I        │
-  │  toggle."                          promise."                    │
-  │ "Built it, retired it, here's    "It worked at some point but   │
-  │  why."                             I had to remove it."         │
-  │ "Naming the gap, not hiding it." "I'm planning to add that."    │
-  │ "Same loop, swappable substrate."  "Well it works on synthetic  │
-  │                                    so it should work on real."  │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-The right column is the junior default. The left column is the move you practice until it's reflex.
-
-  ## The "I don't know" recovery
-
-You will get a question you don't have an answer for. The pattern that works:
-
-```
-  ┃ "Honest answer: I don't know. The thing I do know is [a
-  ┃  related fact you DO know that connects to their
-  ┃  question]. Happy to dig into that part if it's useful."
-```
-
-Three moves: admit the gap, anchor on what you do know, offer the related dig. Do not bluff. Judges remember the bluff longer than they remember the gap.
-
-  ## The one-page run sheet — Q&A
-
-```
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ RUN SHEET — 06 THE Q&A                       post-clock, no cap  │
-  │                                                                  │
-  │ POSTURE: matter-of-fact about AI assistance, specific about      │
-  │          decisions, willing to name gaps.                        │
-  │                                                                  │
-  │ TIER 1 (cold):                                                   │
-  │   Q1 mockup?    → "real. three modes. all run real agent code."  │
-  │   Q2 hard part? → "the eval pipeline — surfaced 3 real bugs."    │
-  │   Q3 stack?     → Next 16 / React 19 / Sonnet / AptKit / MCP /   │
-  │                   NDJSON / Vitest, 24 files / 221 passing.       │
-  │   Q4 AI usage?  → "Claude heavily for code. I wrote the          │
-  │                   architecture and the judgments."               │
-  │   Q5 business?  → "marketers on Bloomreach. DataSource seam      │
-  │                   broadens past Bloomreach."                     │
-  │                                                                  │
-  │ TIER 2 (warm):                                                   │
-  │   Q6 why library? → "built it first. library owns loop, I own   │
-  │                     boundary. legacy preserved as receipt."      │
-  │   Q7 fake data?   → "fake DATA, real behavior."                  │
-  │   Q8 deleted eval?→ "shipped + caught 3 bugs + retired with     │
-  │                     substrate. naming the gap, not hiding it."   │
-  │   Q9 production?  → "demo default. live-bloomreach with OAuth.   │
-  │                     auto-reconnect for token revokes."           │
-  │                                                                  │
-  │ TIER 3 (one-liners ready):                                       │
-  │   Q10 why bloomreach?      → "marketer already there + EQL"     │
-  │   Q11 vs ChatGPT?           → "grounded in tool calls"           │
-  │   Q12 hallucinations?       → "numbers caught at render layer"   │
-  │   Q13 cost?                 → "few cents / briefing, ballpark"   │
-  │                                                                  │
-  │ I DON'T KNOW: admit the gap → anchor on related → offer the dig. │
-  │                                                                  │
-  │ NEVER: bluff. defend AI usage defensively. apologize for         │
-  │        retiring code.                                            │
-  ╰──────────────────────────────────────────────────────────────────╯
+  ╭─ RUN SHEET · CHAPTER 06 · THE Q&A ───────────────────────╮
+  │                                                           │
+  │  When:       after the clock; not counted in the slot     │
+  │  Posture:    short answers, point at receipts, own rough  │
+  │              edges, never hedge                           │
+  │                                                           │
+  │  The six probes — recognize the category, pick the answer:│
+  │                                                           │
+  │  1. "isn't synthetic fake?"                               │
+  │     → name what's fake + fault receipt (9/3/0)            │
+  │                                                           │
+  │  2. "how do you know the eval isn't measuring itself?"    │
+  │     → blind calibration protocol; pilotWarning stamp;     │
+  │        human pass needed; worksheet ready                 │
+  │                                                           │
+  │  3. "what if i break a prompt?"                           │
+  │     → npm run eval:gate; blocks PR at >10pp regression;   │
+  │        CI-wired                                            │
+  │                                                           │
+  │  4. "production deployment?"                               │
+  │     → three modes: demo / live-bloomreach / live-         │
+  │        synthetic; Vercel Pro; auto-reconnect               │
+  │                                                           │
+  │  5. "what about scale?"                                   │
+  │     → session state = bottleneck; N=20 K=3 ~ 28min        │
+  │        estimated; real p99 needs a real load run;         │
+  │        honest                                              │
+  │                                                           │
+  │  6. "why not route monitoring to Haiku?"                  │
+  │     → eval doesn't measure monitoring cost; blind         │
+  │        routing = anti-pattern eval exists to prevent      │
+  │                                                           │
+  │  Off-script fallback:                                     │
+  │    → name the file/module                                 │
+  │    → ask a clarifying question back                       │
+  │    → "the honest answer is i don't know — here's what     │
+  │       i'd need to find out"                                │
+  │                                                           │
+  │  On AI use:                                               │
+  │    → matter-of-fact. name what you own (architecture,     │
+  │       seam choice, eval design, phase-3 retirement) and   │
+  │       what the tools did (a lot of the typing). both      │
+  │       matter.                                              │
+  │                                                           │
+  ╰──────────────────────────────────────────────────────────╯
 ```

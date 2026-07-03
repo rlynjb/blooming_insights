@@ -1,145 +1,197 @@
-# 03 — Options and Opportunity Cost
+# Options and opportunity cost
 
-> The options that were on the table — including `do nothing` — and what each one would have cost in time, complexity, and product surface.
+**"Why this path and not the alternatives?"** The review room's second-favorite probe. This file walks four major architectural options where the wrong choice would have cost real time — and the reasoning that picked the right one, with the opportunity cost of the alternatives named explicitly.
+
+The frame this file uses is the **evaluated-and-accepted decision mode**: you looked at each option, named what it costs, named what its alternative costs, and *decided*. Not "we happened to end up with X." Not "X was the default." Chose, with receipts.
+
+## The shape
 
 ```
-  THE OPTION SPACE — six paths, one chosen
+  Four major options, each with an evaluated pick
 
-  ┌────────────────────────────────────────────────────────────────┐
-  │                                                                │
-  │   A. do nothing            │  ← always on the table            │
-  │   ─────────────────────    │                                   │
-  │   B. dashboard tool        │  build into Bloomreach UI         │
-  │   C. single-agent answerer │  one big agent, one big prompt    │
-  │   D. multi-agent loop      │  ← chose this                     │
-  │      + reasoning trace UI                                      │
-  │   E. native Bloomreach     │  ship as a Bloomreach feature     │
-  │   F. ecommerce-platform-   │  generalize to Shopify / etc      │
-  │      agnostic agent                                            │
-  │                                                                │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ 1. AGENT RUNTIME ──────────────────────┐
+  │  own loop  ─────►  AptKit migration     │
+  │  (evaluated-and-accepted; legacy kept)  │
+  └──────────────────────────────────────────┘
 
-  the chosen option is the one that defends its own scope cuts.
+  ┌─ 2. PORT / ADAPTER FOR DATA ────────────┐
+  │  DataSource seam                         │
+  │  · Olist add  · Olist remove             │
+  │  · Synthetic add  · Fault-injecting      │
+  │  4 uses, zero caller-surface changes    │
+  └──────────────────────────────────────────┘
+
+  ┌─ 3. STREAMING TRANSPORT ────────────────┐
+  │  NDJSON over fetch stream                │
+  │  (rejected: SSE + EventSource)           │
+  │  4-consumer readNdjson kernel proves it  │
+  └──────────────────────────────────────────┘
+
+  ┌─ 4. PORTFOLIO HARDENING SEQUENCING ─────┐
+  │  6 phases over 4 weeks                   │
+  │  eval → obs → cost → fault → gate → CI  │
+  │  per-week reading + per-session commits  │
+  └──────────────────────────────────────────┘
 ```
 
-## The opportunity-cost discipline
+Walk each with the option compared, the opportunity cost of the loser, and the receipt of the pick.
 
-For each option below: **what we build, what we give up, and what the "1-week sniff-test" tells us** — the smallest experiment that would either kill the option or harden it before going further. **The chosen option has to beat `do nothing` on a real axis, not a hand-wave.**
+## Option 1 — Own loop → AptKit migration
 
----
+**The choice.** Started with an own-implementation of the agent loop (Claude + MCP tool use, hand-written). Migrated to `@aptkit/core@0.3.0` as the runtime substrate. Kept the legacy own-loop files as `*-legacy.ts` for rollback receipt.
 
-## Option A — Do nothing
+**The alternative — kept the own loop.**
 
-**What it means:** the analyst keeps doing the three-context loop by hand. We don't ship anything.
+Opportunity cost of *staying* on the own loop:
+- Every substrate improvement aptkit ships (tracing helpers, retry primitives, transport polish) has to be re-implemented in your own code.
+- The bar for what the loop supports (tool schema validation, error surfacing, streaming) is set by *your* patience for maintenance, not by a library invested in getting it right.
+- No shared vocabulary with other engineers using the same substrate — every conversation about the loop has to start with "here's how I wrote it."
 
-**Why it's the baseline:** if `do nothing` wins, no other option matters. Every option below has to defend itself against the cost of building it vs the cost of the analyst's current workflow.
+Opportunity cost of *migrating*:
+- Migration risk. Aptkit could change API. Aptkit could go stale. You're taking on a dependency that could rot.
+- Some of aptkit's assumptions may not fit (the OpenAI-first cost helper is a real example — see Ch 02, cost controls).
 
-**What `do nothing` actually costs:**
-- The analyst keeps context-switching across three tools. That's the status quo — by definition not a regression.
-- Recommendations continue to lack visible reasoning. Stakeholders continue to either trust the analyst or not.
-- The MCP server matures without us using it. The agent capability we have available right now goes unused.
+**The evaluation.** For a portfolio product, the shared-substrate value wins over the maintain-your-own value. You want an interviewer to say "oh, aptkit — I know that shape" rather than "let me read your custom runtime for 20 minutes." And the aptkit gap you found (OpenAI-only cost helper) turned into a *feature* of the story: you shipped the Anthropic pricing helper on top, which shows exactly the kind of substrate-collaboration muscle a portfolio should demonstrate.
 
-**Why we don't pick it:** two reasons, one product, one personal:
-1. **Product:** the reasoning-trace bet is testable. If "show your work" beats "magic answer," we want to know — and `do nothing` doesn't generate that signal.
-2. **Personal (named honestly — this matters in an L5 review):** the project is an AI-engineering portfolio piece for a frontend engineer pivoting into AI roles. **`do nothing` produces no artifact to defend in an interview loop.** That's a real opportunity cost — naming it is the move.
+**Legacy preserved as rollback receipt.** The `*-legacy.ts` files aren't dead code. They're the audit trail. If aptkit ever ships something incompatible, the rollback path is a file-rename, not a git-archaeology exercise. This is Ch 02's "legacy preserved" cut viewed from the *options* angle: keeping legacy was the deliberate insurance policy on the migration decision.
 
-**The honest framing:** `do nothing` is a defensible option for the marketer. It's not defensible for the engineer building the portfolio.
+**The receipt.** `git log` the migration. Old files under `*-legacy.ts`. New agents on aptkit's `Agent` / `runAgentLoop` primitives. Tests pass on both paths (some tests still exercise legacy for the rollback receipt).
 
----
+## Option 2 — DataSource seam (the port/adapter pattern)
 
-## Option B — Build it as a Bloomreach dashboard tool
+**The choice.** Introduce a `DataSource` interface (the port) at `lib/mcp/tools.ts`, with concrete adapters that implement it. Agents depend on the port, not any specific adapter. Adapter selection happens at composition root, not at agent code.
 
-**What it means:** instead of a separate Next.js app with agents, build it as a dashboard inside Bloomreach Engagement. The analyst stays in one tool.
+**This is the option that pays back hardest.** Here's the receipt shape you can put on a whiteboard.
 
-**Why it's tempting:** zero context-switching cost. The product is just "a smarter view inside Bloomreach."
+```
+  DataSource seam — 4 shipped uses, zero caller-surface changes
 
-**What we'd give up:**
-- **The reasoning-trace surface.** A dashboard tile is not a 1/3-width streaming sidebar. Reasoning becomes a "click to expand" tooltip — defeating the bet.
-- **Iteration speed.** Building inside someone else's product means their release cycle, their UI primitives, their auth. We can't ship in a week.
-- **The portability story.** A Bloomreach-internal tool dies if we ever want to be ecommerce-platform-agnostic (see Option F).
-- **Control of the agent loop.** A Bloomreach tile probably can't run a Claude agent with arbitrary tool calls and a `maxToolCalls` budget. The architecture flattens to "send the query, render the answer."
+  ┌─ AGENTS ─────────────────────────────────┐
+  │  DiagnosticAgent · RecommendationAgent   │
+  │  MonitoringAgent · QueryAgent            │
+  │                                           │
+  │  depend on ▼                              │
+  │      DataSource (the port)                │
+  └──────────────────┬───────────────────────┘
+                     │
+     ┌───────────────┼───────────────┬─────────────┐
+     ▼               ▼               ▼             ▼
+  Bloomreach    Olist MCP       Synthetic     Fault-injecting
+   MCP adapter   adapter         adapter       decorator
+                                                (wraps another)
+  · used 1        · added 1       · used 3      · used 4
+    live prod       proved seam    demo mode      offline drill
+    briefings                      + eval
+```
 
-**The 1-week sniff-test:** ask Bloomreach if a Bloomreach customer can run a Claude agent that streams reasoning inside their UI. If the answer is "we'd have to build that infra," the option is dead.
+**The alternative — direct MCP client calls.**
 
-**Why we don't pick it:** the reasoning trace is the differentiator, and a dashboard tile can't host it as a first-class surface. The bet collapses.
+Opportunity cost of *not* having the port:
+- Every place an agent needs data is coupled to the MCP client's specific method signatures.
+- Adding a second data source means editing agent code, not adding an adapter.
+- Testing without hitting a live MCP server means mocking the MCP client — noisy, fragile.
+- Demo mode has to fork the whole agent path instead of swapping one dependency.
 
----
+**The evaluated evidence — 4 uses, zero caller-surface changes.** This is the receipt that makes the seam defensible in an interview. The port was proved not by *arguing* it was clean, but by *using* it four different ways without changing the code that depends on it:
 
-## Option C — Single-agent answerer (one big agent, one big prompt)
+1. **Olist MCP adapter — added.** A second, third-party MCP server (Olist, ecommerce dataset) was wired up as an alternate DataSource. Agents worked against it unchanged. This was the *first* proof the port wasn't a same-shape-different-name — the adapter did real translation.
+2. **Olist MCP adapter — removed.** Once the seam was proved, the Olist adapter was retired in favor of the cleaner Synthetic path. Removal without caller changes = the seam works in both directions.
+3. **SyntheticDataSource — added.** In-process data generator that fabricates workspace-shaped responses for demo mode. No network. No auth. Used by the eval and by the demo path.
+4. **FaultInjectingDataSource decorator — added.** Wraps any other DataSource and injects failures at the port boundary. Used for the fault-tolerance drill (Ch 02, un-cut fault tolerance).
 
-**What it means:** one agent. One system prompt. Ask "what's wrong with my workspace?" and let the model do everything — anomaly detection, diagnosis, recommendation — in one long turn.
+Four shipped uses, no agent code changed. That's the port/adapter pattern earning its keep.
 
-**Why it's tempting:** simpler code. No coordinator. No handoff between agents. The model "just figures it out."
+**The interview line.** *"The DataSource seam looked speculative until it earned 4 uses without changing caller code: Olist add, Olist remove, Synthetic add, Fault-injecting decorator. That's the abstraction receipt — a seam nobody uses isn't a seam."*
 
-**What we'd give up:**
-- **Predictable structure.** A multi-agent split with `AgentName = coordinator|monitoring|diagnostic|recommendation` (in `lib/mcp/types.ts`) gives every step a known shape — known inputs, known outputs, known evaluation criteria. A single-agent answerer is unpredictable; you don't know which step it's on, so the UI can't render a stepper that means anything.
-- **The stepper UI itself.** The shared `ProcessStepper` (monitoring → investigating → decision) **only makes sense if there are discrete stages.** A single-agent answerer collapses the stepper into a single spinner.
-- **Independent evaluation.** With separate agents, each one can be evaluated against its own rubric (detection precision/recall, diagnosis criteria, recommendation criteria). With one agent doing everything, you only get end-to-end pass/fail — much weaker signal.
-- **Cost control.** Separate agents = separate token budgets. The monitoring agent doesn't need a 200K-token context window; the diagnostic one might. Mixing them wastes tokens.
+## Option 3 — NDJSON over fetch stream
 
-**The 1-week sniff-test:** prompt-engineer a single agent that does monitoring + diagnosis + recommendation in one turn. Time how long it takes to produce one anomaly's worth of work. If the latency is acceptable and the structure is consistent, the option is alive. **It is neither, in practice — the loop diverges, the structure is mush, and the trace is unparseable.**
+**The choice.** Newline-delimited JSON events streamed over a `ReadableStream` from an HTTP endpoint, read on the client with `fetch` + a stream reader. Not Server-Sent Events. Not WebSockets.
 
-**Why we don't pick it:** the single-agent shape can't support the stepper UI, can't support per-step evaluation, and can't sustain the reasoning-trace surface as a coherent narrative. The structure isn't a code-cleanliness preference; **it's what makes the product visible.**
+**The alternative — Server-Sent Events + `EventSource`.**
 
----
+Opportunity cost of *SSE + EventSource*:
+- `EventSource` doesn't support POST — you can't send a request body with the streaming request. That means passing the request as URL params or setting up a two-request handshake (POST to create job, GET to subscribe). More moving parts.
+- `EventSource`'s auto-reconnect is helpful when it fires and painful when it doesn't. The MCP alpha's token revocation would trigger reconnects with stale tokens, which is worse than a clean error.
+- SSE's data frames must be text (base64 encoded for binary). Fine here since NDJSON is text, but constrains you if the payload ever needs binary.
 
-## Option D — Multi-agent loop + reasoning trace UI (CHOSEN)
+Opportunity cost of *NDJSON over fetch*:
+- No built-in reconnect — you write the retry logic yourself. In this codebase that's `app/page.tsx`'s auto-reconnect-once-on-`invalid_token`.
+- Parsing is manual — you carry a buffer, split on newlines, JSON.parse each event.
 
-**What it means:** a coordinator + three specialist agents (monitoring, diagnostic, recommendation), each with its own prompt and tool set. The reasoning trace is streamed as NDJSON and rendered as a first-class UI surface on every page.
+**The evaluated evidence — 4-consumer readNdjson kernel.** The `readNdjson` function reads a stream and yields parsed events. It's used by 4 distinct consumers:
+1. The feed page consuming `/api/briefing`.
+2. The diagnose page consuming `/api/agent?step=diagnose`.
+3. The recommend page consuming `/api/agent?step=recommend`.
+4. The dev capture path consuming `/api/agent` (combined run).
 
-**What we get:**
-- **The stepper UI maps 1:1 to the agent split.** Monitoring → investigating → decision matches the agent identities. The user's mental model and the code's structure are the same model.
-- **Per-step evaluation is possible.** Each agent can be evaluated against its own rubric (detection precision/recall, diagnosis criteria, recommendation criteria). The 4-pillar eval suite that surfaced the BRL bug, the calibration drift, and the conclusion instability **was only possible because the agents are separately addressable.**
-- **The reasoning trace is structured.** Each `AgentEvent` carries the agent identity, the step kind, the tool calls, and the timestamps — so the trace renders as "the monitoring agent called `execute_analytics_eql` with this EQL and got this result" rather than "the AI did some stuff."
-- **Independent iteration.** The recommendation agent's prompt can be rewritten without re-validating monitoring or diagnosis. That's a real velocity win when the product is being tuned weekly.
+One parsing kernel, four consumers, one wire format (`AgentEvent` — see `lib/mcp/events.ts`). That's the shipped abstraction receipt — the parser earned its shape by being reused unchanged.
 
-**What we give up:**
-- **Code complexity.** Four agents, a coordinator, the NDJSON event protocol, the streaming UI plumbing — more code than Option C. This is the deliberate cost.
-- **Latency overhead.** Each agent handoff is a model call, plus serialization through the event stream. Acceptable for the analyst persona (their alternative is a 15-minute manual loop), unacceptable for an "instant answer" persona — and that persona is not the user.
-- **A migration we had to make.** Phase 1 used a hand-rolled `runAgentLoop` (deliberate at the time — needed `maxToolCalls` budget + forced synthesis turn against the rate-limited server, `lib/agents/base-legacy.ts` preserves it). Phase 4 migrated to `@aptkit/core@0.3.0` via 3 adapter classes in `lib/agents/aptkit-adapters.ts`. **Library owns the loop, I own the boundary, legacy preserved as a rollback receipt.** That's an `evaluated-and-accepted` move — revisiting a decision that was originally defended deliberately, once the better surface existed.
+**The interview line.** *"NDJSON over `fetch` because `EventSource` doesn't support POST bodies and its auto-reconnect fights the MCP alpha's token revocation. The `readNdjson` kernel has 4 consumers with one wire format. Reuse without modification is how you know the abstraction is real."*
 
-**Why we picked it:** it's the only option that supports the reasoning-trace surface as a first-class product surface, the only one where the stepper UI maps to a real architecture, and the only one where per-agent evaluation is even possible. The cost is justified.
+## Option 4 — Portfolio hardening plan sequencing
 
----
+**The choice.** 6 phases over 4 weeks. Each phase has an explicit ordering rationale — earlier phases unlock later ones. Per-week reading discipline (docs + repo dive before writing code). Per-session commit hygiene (small commits, receipts in commit messages).
 
-## Option E — Ship as a native Bloomreach feature (vs an independent app)
+**The alternative — build features until something ships, then harden reactively.**
 
-**What it means:** partner with Bloomreach and ship this as part of Bloomreach Engagement — not as a separate webapp. Effectively a more ambitious version of Option B.
+Opportunity cost of *reactive hardening*:
+- You harden the parts you notice, not the parts that matter. Squeaky-wheel maintenance.
+- No baseline to measure against, so "I fixed X" has no proof.
+- Portfolio narrative becomes "here are the parts I got around to" instead of "here's the flywheel I built."
 
-**Why it's tempting:** every Bloomreach customer gets it. Distribution is solved. We don't have to acquire users.
+**The sequencing that actually shipped.** Each phase is ordered because the previous phase's receipt is the next phase's foundation:
 
-**What we'd give up:**
-- **Iteration speed and product control.** Bloomreach's release cycle, brand constraints, support obligations, security review for every change.
-- **The ability to ship a v0 in weeks.** A native feature has to land at v1.0 quality from day one — there's no "ship the loop first, evaluate against a stable substrate later" path.
-- **The portfolio story.** A feature inside someone else's product is harder to point at in an interview than an app you can demo end-to-end.
+```
+  6 phases, ordered by dependency
 
-**The 1-week sniff-test:** none, really — this is a business-development question, not a technical one. The answer is "we don't have a Bloomreach partnership and acquiring one takes months."
+  ┌─ Phase 1: EVAL ─────────────────────────┐
+  │  goldens, rubrics, blind calibration,   │
+  │  regression gate                         │
+  │  → unlocks: measured baseline            │
+  └──────────────┬───────────────────────────┘
+                 │
+  ┌─ Phase 2: OBSERVABILITY ────────────────┐
+  │  per-run receipts, aggregation script    │
+  │  → unlocks: cost + latency numbers       │
+  └──────────────┬───────────────────────────┘
+                 │
+  ┌─ Phase 3: COST ─────────────────────────┐
+  │  prompt caching, pricing helper,         │
+  │  BudgetTracker check-before-dispatch     │
+  │  → unlocks: fail-closed cost bound       │
+  └──────────────┬───────────────────────────┘
+                 │
+  ┌─ Phase 4: FAULT TOLERANCE ──────────────┐
+  │  FaultInjectingDataSource decorator      │
+  │  → unlocks: 3rd use of the seam          │
+  └──────────────┬───────────────────────────┘
+                 │
+  ┌─ Phase 5: REGRESSION GATE ──────────────┐
+  │  eval:gate vs committed baseline         │
+  │  → unlocks: CI can block on quality      │
+  └──────────────┬───────────────────────────┘
+                 │
+  ┌─ Phase 6: CI INTEGRATION ───────────────┐
+  │  gate wired to PR flow                   │
+  │  → unlocks: portfolio-defensible flywheel│
+  └──────────────────────────────────────────┘
+```
 
-**Why we don't pick it (now):** distribution-via-Bloomreach is a real win, but it's a separate decision from "is this product worth building." Build it independently first, then have the partnership conversation with a working demo in hand. **Sequencing matters — picking it now means waiting on someone else's calendar.**
+Each phase's output was the next phase's input. Phase 1 without Phase 2 has no way to aggregate. Phase 2 without Phase 3 has no cost lever to pull. Phase 5 without the earlier phases has nothing to gate against.
 
----
+**Per-week reading discipline.** Before each phase, read the relevant docs (Anthropic caching docs before Phase 3, Vercel streaming docs before Phase 2 obs). The reading isn't performance — it's the reason the code shipped correctly the first time instead of the third.
 
-## Option F — Ecommerce-platform-agnostic agent (Shopify / WooCommerce / Bloomreach)
+**Per-session commit hygiene.** Small commits with receipts in the commit messages. Not "wip" and not "cleanup." Each commit stands as an audit trail of what was tried, what worked, what was reverted.
 
-**What it means:** abstract the analytics platform behind a `DataSource` port; the agents work against any backing platform. Ship for Bloomreach, Shopify, WooCommerce, BigCommerce.
+**The interview line.** *"The hardening plan wasn't 'do these things eventually.' It was 6 phases ordered by dependency — each phase's output was the next phase's input. Phase 1 (eval) was the foundation because it gave me a baseline to measure everything else against."*
 
-**Why it's tempting:** larger market. The reasoning-trace value prop is platform-agnostic.
+## The pattern — how to defend option choices in general
 
-**What we'd give up:**
-- **Time-to-validate.** Building three or four adapters means we don't have a working v0 against any one platform. The product becomes "an integration project" before it becomes "an analyst's reasoning loop."
-- **The depth of the Bloomreach integration.** Bloomreach has scenarios, segments, vouchers, experiments — a specific recommendation vocabulary. Shopify has Flow, customer segments, Shopify Email. Generalizing the recommendation agent means it can only suggest the lowest-common-denominator action — losing the "name the exact Bloomreach feature" precision that's currently a strength.
-- **A reasoning-trace surface that has to work the same across platforms.** That's a substantive product-design problem we haven't solved.
+The move that works in the review room:
 
-**The 1-week sniff-test:** would a Shopify analyst pay for an AI loop that proposes "create a Shopify Flow trigger" with full reasoning? Probably yes. But the sniff-test for **the integration cost being acceptable** is much longer than one week.
+1. **Name the option you picked.** Direct.
+2. **Name the alternative you rejected.** Specific — not "some other approach," but *the* alternative.
+3. **Name the opportunity cost of BOTH.** Yours *and* theirs. Owning your cost is the credibility move.
+4. **Name the evidence that closes the loop.** For each pick above, the closing evidence is a *shipped receipt* — 4 uses of the seam, 4 consumers of the parser, 6 phases with their gate to CI, aptkit + legacy files both in the tree.
 
-**Why we don't pick it (now):** Bloomreach-specific is the right scope for v0 because **the recommendation vocabulary is the load-bearing detail.** Generalizing too early means the recommendations get vaguer. **The `DataSource` seam (the port + the in-process Synthetic adapter that lives behind it) keeps the option open** — if we want to add a second platform later, the seam is built. But we're not adding it now.
-
----
-
-## The chosen option, said sharply
-
-**Option D — multi-agent loop + reasoning-trace UI as a first-class surface, Bloomreach-specific, read-only, no persistence, demo-snapshot for reliable presentation.**
-
-The opportunity cost we accepted: code complexity (more agents, more plumbing) and platform specificity (we're not generalizing yet). Both costs are bounded and named. **Every other option either collapses the differentiator (B, C, E) or delays time-to-validate to the point where we can't generate signal (F) or generates no signal at all (A).**
-
-The defensible posture in a review is: "I considered each of these, named what I gave up, named the 1-week sniff-test, picked D. Here's the receipt — every cut in `02-scope-cuts-and-non-goals.md` is a deliberate consequence of picking D, not an accident."
+Every option in this file follows that shape. Every option you'll be asked about should.

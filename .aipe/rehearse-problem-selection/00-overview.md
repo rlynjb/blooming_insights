@@ -1,67 +1,70 @@
-# Problem Selection — Overview
+# Problem selection — overview
 
-> Why this problem deserves investment, before any solution design.
+The rehearsal book for **why blooming_insights deserved investment**, not how it was built. Five files, walked in order, each answering one question the review room asks before any solution is credible.
 
-```
-  THE BRIEF — five questions in dependency order
+## What this book is
 
-  ┌─ 1. PROBLEM ────────────────────────────────────────┐
-  │  who experiences what pain, with what evidence?     │
-  └─────────────────────┬───────────────────────────────┘
-                        │  if no real pain — STOP
-  ┌─ 2. SCOPE ──────────▼───────────────────────────────┐
-  │  the narrowest slice that proves the premise        │
-  └─────────────────────┬───────────────────────────────┘
-                        │  if scope can't be cut — STOP
-  ┌─ 3. OPTIONS ────────▼───────────────────────────────┐
-  │  including `do nothing` — what's the opportunity    │
-  │  cost of building this vs not?                      │
-  └─────────────────────┬───────────────────────────────┘
-                        │  if `do nothing` wins — STOP
-  ┌─ 4. METRICS ────────▼───────────────────────────────┐
-  │  how do we know it worked? what's the feedback loop?│
-  └─────────────────────┬───────────────────────────────┘
-                        │
-  ┌─ 5. SKEPTIC ────────▼───────────────────────────────┐
-  │  the review-room questions that the brief survives  │
-  └─────────────────────────────────────────────────────┘
-```
+Coach voice. You're days from a senior loop where an interviewer probes not the code but the *choice*: "why this problem, why now, why you." The book gives you the receipts to hold that ground under pressure.
 
-## The thirty-second pitch
+The distinction that matters: **problem selection is the human layer before solution design**. A brilliant architecture on the wrong problem loses to a decent architecture on the right one. This book is where you show you picked the right one — and can defend the pick.
 
-The job-to-be-done — a marketer on Bloomreach Engagement currently runs the human-analyst loop by hand: notice a metric moved, hunt for the cause, decide which Bloomreach feature to reach for. Three jobs, three contexts, no continuity between them. **blooming insights** runs that loop end-to-end and **streams the reasoning as a first-class surface** — "an analyst that shows its work."
-
-The differentiator is not "AI for analytics" (commodity). It's the **show-your-work** seam: every conclusion carries the exact tool call, the current-vs-prior numbers, and a streamed log of the agent's thinking, visible in a sticky sidebar (`StatusLog`) on every page. That's the bet — that trust beats magic for an analyst persona who has to explain the decision to their boss.
-
-## Why a problem-selection brief, not a feature spec
-
-The audit family already covers HOW the system is built. This brief defends WHY this problem deserves attention before anyone writes another line of agent code. Three things it has to do that a feature spec doesn't:
-
-1. **Name the pain in the analyst's words, with repo evidence, not market vibes.** The repo proves the workflow (the three-stage stepper, the diagnose-then-recommend split, the EQL-only data path); the brief makes that evidence explicit.
-2. **Defend the scope cuts.** No persisted dashboards. No save/share. No multi-tenant. No write-back to Bloomreach. Each cut is a deliberate "not this version." A reviewer who doesn't see the cuts named will assume they were forgotten.
-3. **Include `do nothing` as a real option.** The brief loses credibility the moment `do nothing` isn't on the table — because in a real product review, it always is.
-
-## What the brief is grounded in
-
-Repo-visible evidence only. Where this brief talks about user pain, it points at the repo artifact that proves the workflow exists (the three-stage stepper, the dual-agent split, the EQL ad-hoc-only data model). Where it talks about constraints, it points at the code that enforces them (~1 req/s rate limit in `lib/mcp/client.ts`; token revocation handling in `lib/mcp/auth.ts`; in-memory state, no database). Where it makes a claim that the repo cannot prove, the brief labels it as **inference** or as a **discovery question** that must be answered before scaling investment.
-
-## What this brief is NOT
-
-- Not a market sizing exercise — the repo doesn't have the data to ground that, and pretending it does is the fastest way to lose a senior reviewer's trust.
-- Not a feature roadmap — the cuts are as important as the inclusions.
-- Not a defense of the implementation — that's what `rehearse-interview-defense` is for. This brief defends the **decision to invest at all.**
-
-## Reading order
+## Where this sits — the map
 
 ```
-  00-overview.md                          ← you are here
-  01-problem-brief.md                     pain + evidence + why now + beneficiaries
-  02-scope-cuts-and-non-goals.md          what NOT to build (and why)
-  03-options-and-opportunity-cost.md      do nothing · narrow · broad · what each costs
-  04-success-metrics-and-feedback-loop.md observable outcomes + how we'd know
-  05-skeptical-reviewer-questions.md      the review-room questions the brief survives
+  Rehearse family — four books, one arc
+
+  ┌─ 01 problem-selection ────────────┐  ← you are here
+  │  WHY this problem deserves        │     the human layer
+  │  investment                        │     before solution
+  └─────────────┬──────────────────────┘
+                │  once problem is defensible
+                ▼
+  ┌─ 02 design-doc ───────────────────┐
+  │  HOW a significant technical      │
+  │  decision was communicated         │
+  └─────────────┬──────────────────────┘
+                │  once design is on the table
+                ▼
+  ┌─ 03 hackathon-demo ───────────────┐
+  │  HOW the resulting value          │
+  │  gets shown live                   │
+  └─────────────┬──────────────────────┘
+                │  once demo lands
+                ▼
+  ┌─ 04 interview-defense ────────────┐
+  │  HOW the work is defended         │
+  │  under scrutiny                    │
+  └────────────────────────────────────┘
 ```
 
-## The single sharpest defense
+Problem-selection sits *first* because everything downstream inherits from it. Design docs justify tradeoffs against the problem. Demos land the value the problem defined. Interview defense answers "why did you build this?" with the brief in this book.
 
-If you can only carry one sentence into the review room: **"The differentiator isn't the agent — it's the reasoning trace, and the repo proves I built the trace as a first-class surface, not as an afterthought log."** Everything in this brief radiates from that claim.
+## The five files
+
+Each file answers one review-room question. Walk them in order — later files assume the earlier ones.
+
+```
+  01  problem-brief                        WHO hurts, HOW MUCH, WHY NOW
+  02  scope-cuts-and-non-goals             WHAT you deliberately didn't build
+  03  options-and-opportunity-cost         WHICH paths you rejected, and why
+  04  success-metrics-and-feedback-loop    HOW you know it's working
+  05  skeptical-reviewer-questions         THE probes and the answers that hold
+```
+
+- **`01-problem-brief.md`** — the user, the pain, the evidence, the "why now." The core artifact. If the review room only reads one file, it's this.
+- **`02-scope-cuts-and-non-goals.md`** — what you cut and why. The cuts you *reconsidered and un-cut* are the L5 signal — showing the eval work, cost controls, and fault tolerance shipped end-to-end after being deferred.
+- **`03-options-and-opportunity-cost.md`** — the paths not taken. Own loop → aptkit migration. DataSource seam pattern (4 uses shipped). NDJSON over fetch stream. Portfolio hardening sequencing. Each with the opportunity cost named.
+- **`04-success-metrics-and-feedback-loop.md`** — real measured numbers from baseline `2026-07-03T04-08-28-644Z`. Per-phase latency, per-case cost, per-criterion pass rates. The regression gate that closes the loop.
+- **`05-skeptical-reviewer-questions.md`** — the six probes you'll actually get, each with the answer that holds under follow-up.
+
+## The strongest defense in one line
+
+You built an AI analyst that runs the human-analyst loop for a Bloomreach ecommerce workspace — **and then spent 4 weeks shipping the eval + observability + cost-control + fault-tolerance + regression-gate flywheel around it, receipt-backed at every step.** The eval isn't a past-tense side story. It's the shipped centerpiece that lets you make claims like "actionable_next_step baseline is 0%, here's why, here's the fix, here's the gate that blocks regression on it" — which is what "an analyst that shows its work" looks like when you turn it on yourself.
+
+Everything else in this book is downstream of that move.
+
+## How to read this book
+
+- **Before an interview loop:** read all five in order. ~30 min.
+- **Before a specific probe:** jump to Ch 05, find the question, read the answer, then read the file it cites for the receipts.
+- **Under pressure:** Ch 05 is the memorize-this file. The others give it depth.

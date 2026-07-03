@@ -1,205 +1,360 @@
-# Chapter 02 — The demo (1:00–6:00, 5 minutes)
+# Chapter 02 — The demo (1:00–6:00, five minutes)
 
-This is the centerpiece. Half your slot. The chapter the rest of the book exists to support. By the end of these five minutes the room either gets why blooming insights is different from "a chatbot that summarizes my dashboard," or you've lost them — and no architecture diagram in chapter 03 will pull them back.
+This is the centerpiece. Five minutes, the largest slice of the slot, and the chapter that decides whether the room walks out remembering the product or the pitch. The money shot lands inside the first ninety seconds of this chapter — at ~2:30 on the master clock, well inside the first third of the slot — and everything from there compounds.
 
-The differentiator you are demoing is **the streaming reasoning trace**. Not the answer. Not the recommendation. The fact that as the agent works, the room *watches it work* — each query, each hypothesis, each tool result appearing in the right column in real time, while the left column composes the conclusion. The money shot is the moment the trace fills the screen with the agent's actual thinking and the room realizes they are watching a *process*, not consuming an output. That moment lands at **2:30**, inside the first third of the slot. Everything before it sets the table. Everything after it builds on the fact that the room is now leaning in.
-
-The stage path is `live-synthetic`: real agents, real Claude, real streaming trace, deterministic in-process data. No OAuth, no rate limits, no token revocation. This is the path that has the production agent behavior and none of the production reliability cliffs.
+You have three beats: the **live-synthetic investigation** (the money shot), the **fault-injection side-quest** (the receipt), and the **eval:report money table** (the closing punch). The demo path is `live-synthetic` end to end. Not `demo`, not `live-bloomreach`. Rehearse this until the muscle memory is automatic.
 
   ## The time-budget bar
 
-```
-  ┌────────────────────────────────────────────────────────────────┐
-  │ ░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░ │
-  │ 0:00 ────── 1:00 ───────────★ 2:30 ─────────── 6:00 ──── 10:00 │
-  │             THE DEMO — you own 1:00 to 6:00 (5 minutes)         │
-  │             ★ MONEY SHOT lands at 2:30 (inside the first third) │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-  ## The chapter-opening diagram — the click path
-
-Three stages, walked in order: **monitoring** (the feed paints), **investigation** (one card opens, the diagnostic agent runs), **decision** (the recommendation agent runs and proposes a Bloomreach action). The trace column is alive at every step. The screen layout is identical across stages — same stepper, same `max-w-5xl` width, same two-column grid — so the room follows the *process* rather than re-orienting to a new layout.
+  You own the largest chunk of the slot. The money shot lands early. The two closing receipts land late. Nothing in between is filler.
 
 ```
-  THE CLICK PATH — 5 MINUTES, THREE STAGES
-
-  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-  │  STAGE 1        │  │  STAGE 2        │  │  STAGE 3        │
-  │  monitoring     │─▶│  investigation  │─▶│  decision       │
-  │  (the feed)     │  │  (one card)     │  │  (the action)   │
-  │                 │  │                 │  │                 │
-  │  app/page.tsx   │  │  app/investigate│  │  .../recommend/ │
-  │                 │  │   /[id]/page    │  │   page.tsx      │
-  │                 │  │                 │  │                 │
-  │  monitoring     │  │  diagnostic     │  │  recommendation │
-  │  agent runs;    │  │  agent runs;    │  │  agent runs;    │
-  │  cards paint    │  │  evidence       │  │  proposes a     │
-  │  left, trace    │  │  panel paints,  │  │  bloomreach     │
-  │  paints right   │  │  trace paints   │  │  feature with   │
-  │                 │  │                 │  │  expected impact│
-  │  ⏱ 1:00–3:30    │  │  ⏱ 3:30–5:00    │  │  ⏱ 5:00–6:00    │
-  │  ★ money shot   │  │                 │  │                 │
-  │    at 2:30      │  │                 │  │                 │
-  └─────────────────┘  └─────────────────┘  └─────────────────┘
-        click          click "see              click "see
-        nothing —      investigation →"        recommendations →"
-        wait & talk    on the card
-
-  ProcessStepper across the top stays visible the whole time.
-  StatusLog (the trace) stays in the right column the whole time.
-  The room's eye doesn't reset between stages.
+  ┌──────────────────────────────────────────────────────────┐
+  │ ░░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │
+  │ 0:00 ── 1:00 ─────────────── 6:00 ────────────────── 10:00 │
+  │        THE DEMO — you own 1:00 to 6:00 (5 minutes)         │
+  │                    ★ money shot lands at ~2:30             │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Three stages, two clicks. That's it. You are not navigating settings, you are not creating an account, you are not switching tabs. The whole demo is on the rail the user would actually use.
+  ## The click-path — the whole demo on one diagram
 
-  ## Stage 1 — Monitoring (1:00–3:30) — where the money shot lives
-
-You start on the feed. The mode toggle is set to `live-synthetic`. The page loads, the briefing route boots a fresh `SyntheticDataSource`, the monitoring agent starts running, and **the trace column comes alive**. This is the moment. Your job for the next 90 seconds is to do almost nothing — let the agent work and narrate the *value* of what the room is seeing.
-
-| SHOW (on screen)                                                     | SAY (out loud)                                              |
-|----------------------------------------------------------------------|-------------------------------------------------------------|
-| Page first paints. Stepper at top: stage 1 active. Left column: skeleton cards. Right column: status log shows "scanning your workspace…" | "I'm picking live-synthetic mode — real agents, real Claude, deterministic data so the demo doesn't depend on the conference wifi being kind." |
-| Trace begins to paint: `▸ scanning events…`, then a tool call: `execute_analytics_eql · count purchase` appears with a status dot | "the right column is the **monitoring agent**. Every line is one step it actually took — every tool call is one EQL query it ran against the workspace." |
-| Another tool call appears: `execute_analytics_eql · sum purchase.total_price`. Then a hypothesis line in the trace. | "it's not following a script. There are no saved dashboards. The agent is deciding what to query based on what it sees." |
-| **★ 2:30 — MONEY SHOT.** The trace column has ~6 tool calls now, scrolling. The first card paints on the left: `● usa purchase_revenue · -38.4%` with summary, why-it-matters, scope, prior→now bars. | *(let it paint — say nothing for 2 seconds)* "**that's it. An analyst that shows its work.**" |
-| A second card paints below the first. Trace keeps scrolling. | "and it doesn't stop at one — it ranks by severity, scopes globally or to a country segment only when the data says to." |
-
-You are now at roughly 3:00. The room has seen the trace fill the screen and a real card appear from it. The differentiator has landed.
-
-The reason this works as a money shot — and the reason this product is different from a "ask GPT about my dashboard" wrapper — is that the trace is not a *log of work that already happened.* It is the work, streamed live as it happens. The NDJSON event stream from `app/api/briefing/route.ts` paints into `ReasoningTrace` as each `reasoning_step`, `tool_call_start`, `tool_call_end`, and `insight` event arrives. The room sees the agent thinking. That is the entire pitch in one visual.
+  Here is the exact click-path you rehearse. Every arrow is a click or a keystroke; every box is what the room sees on screen. If you can walk this diagram without the page in front of you, you can present it under stress.
 
 ```
-  ┃ "Every line on the right is one step the agent actually took.
-  ┃  Every tool call is one EQL query it ran against the workspace.
-  ┃  Nothing here is pre-recorded."
+  The click-path — five minutes, three beats, one money shot
+
+  ┌── 1:00 ─────────────────────────────────────────────────────┐
+  │                                                              │
+  │  Feed page, StatusLog streaming from the cold open           │
+  │  Three anomaly cards render into Col 1 as the trace          │
+  │  finishes (from `/api/briefing` NDJSON)                      │
+  │                                                              │
+  │      ▼ click the top card (critical: usa purchase_revenue)   │
+  │                                                              │
+  ├── 1:15 ─────────────────────────────────────────────────────┤
+  │                                                              │
+  │  Investigate page (step 2 — "investigating the issue")       │
+  │  InvestigationSubject banner at top                          │
+  │  EvidencePanel loading; StatusLog right-hand column starts   │
+  │  streaming diagnostic agent reasoning (from `/api/agent`)    │
+  │                                                              │
+  │      ▼ (do not click — let the trace stream)                 │
+  │                                                              │
+  ├── 2:30 ────────────────────────────── ★ MONEY SHOT ─────────┤
+  │                                                              │
+  │  Diagnostic conclusion renders in Col 1                      │
+  │  Right panel shows the tool_call blocks (execute_analytics_  │
+  │  eql), the hypotheses considered, and the affected-customers │
+  │  callout. The trace has visible reasoning steps in the       │
+  │  agent's own voice ("hypothesis 2 is supported by…")         │
+  │                                                              │
+  │      ▼ click "see recommendations →"                         │
+  │                                                              │
+  ├── 3:00 ─────────────────────────────────────────────────────┤
+  │                                                              │
+  │  Recommend page (step 3 — "decision & recommendation")       │
+  │  RecommendationCards render with feature chip, confidence    │
+  │  dot, numbered steps, expected impact callout                │
+  │                                                              │
+  │      ▼ cmd-tab to terminal                                   │
+  │                                                              │
+  ├── 4:00 ─── SIDE QUEST ─────────────────────────────────────┤
+  │                                                              │
+  │  Terminal already has this command pre-typed (do not type    │
+  │  live; every second typing is a second lost):                │
+  │                                                              │
+  │    LOAD_N=5 FAULT_TIMEOUT=0.1 FAULT_MALFORMED_JSON=0.1 \     │
+  │      FAULT_SEED=42 npm run eval:load                         │
+  │                                                              │
+  │      ▼ press Enter                                           │
+  │                                                              │
+  │  Output scrolls: fault injections annotated, 3 investigations│
+  │  complete cleanly, final line reads "9 faults injected,      │
+  │  3/3 investigations succeeded"                               │
+  │                                                              │
+  │      ▼ cmd-tab (or new pane) → run:                          │
+  │                                                              │
+  ├── 5:00 ─── CLOSING PUNCH ──────────────────────────────────┤
+  │                                                              │
+  │  Terminal:  npm run eval:report                              │
+  │                                                              │
+  │  The p50/p95/p99 table renders — per-phase latency and       │
+  │  per-case cost from `eval/receipts/`                         │
+  │                                                              │
+  │      ▼ deliver the closing line                              │
+  │                                                              │
+  └── 6:00 ─────────────────────────────────────────────────────┘
+       Hand off to Chapter 03 — Under the hood
 ```
 
-  ## Stage 2 — Investigation (3:30–5:00)
+  ## Beat 1 — the investigation (1:00–3:00)
 
-Click the first card. You land on `app/investigate/[id]/page.tsx`. The stepper advances. The diagnostic agent starts. **The trace column comes alive again** — this time with the diagnostic agent's queries (a different agent, a different prompt, but the same streaming UX). The left column builds an `EvidencePanel`: the conclusion, the affected-customer callout, the evidence list, the hypotheses considered.
-
-| SHOW (on screen)                                                | SAY (out loud)                                              |
-|-----------------------------------------------------------------|-------------------------------------------------------------|
-| Click on the USA card. Page navigates. Stepper now shows stage 2 active. Subject banner at top: "investigating: usa purchase_revenue −38.4%". Right column starts a new trace. | "I'm clicking into the USA drop. This is a **different agent now** — the diagnostic one. Its job is to find the cause." |
-| Trace shows the diagnostic agent's tool calls scrolling: hypothesis lines, EQL queries against `view_item`, `cart_update`, `session_start`. | "you can see it's testing hypotheses against the data, not guessing. It's checking the funnel — view → cart → checkout — to see where the drop is concentrated." |
-| EvidencePanel paints on the left: conclusion text, "affected customers: ~3,400", evidence list with `via execute_analytics_eql`, collapsible hypotheses. | "and it cites its evidence. Every conclusion comes with the exact tool call that produced it, the numbers it saw, and the hypotheses it ruled out — including the ones that didn't pan out." |
-
-You are at roughly 4:30. Hover-show the hypotheses list briefly to make the point that ruled-out hypotheses are surfaced too — that's the "shows its work" promise extended past the happy answer.
+  You are landing the money shot. Two clicks: the anomaly card, then wait. The wait is the demo. Do not fill silence — the room's eyes go to the right-hand StatusLog panel where the diagnostic agent's reasoning is streaming, and every word out of your mouth should point at what they're seeing, not narrate the interface.
 
 ```
-  ┃ "It cites its evidence. Including the hypotheses that didn't
-  ┃  pan out."
+  SHOW (on screen)                    SAY (out loud)
+  ────────────────────────            ──────────────────────────
+  three anomaly cards visible;        "so — the monitoring agent
+  top card is `usa                     ran a period-over-period
+  purchase_revenue · −38.4%           scan and flagged three
+  · critical`                         changes it thinks matter.
+                                       ranked by severity."
+  ────────────────────────            ──────────────────────────
+  click the top card                  "let's dig into the biggest
+                                       one."
+  ────────────────────────            ──────────────────────────
+  investigate page loads;             "now the diagnostic agent is
+  StatusLog on right starts            forming hypotheses. what
+  streaming reasoning + tool           you're seeing on the right
+  calls in real time                   is not a mock — that's the
+                                       actual model output. each
+                                       tool call runs EQL against
+                                       the workspace and comes back
+                                       with real numbers."
+  ────────────────────────            ──────────────────────────
+  ★ 2:30 — diagnostic                 "there it is — hypothesis 2
+  conclusion renders; hypothesis      is supported, hypothesis 1
+  section fills; affected-             is not. it sized the affected
+  customers callout appears           segment, cited its evidence,
+                                       and named a diagnosis. that's
+                                       the money shot for me."
+  ────────────────────────            ──────────────────────────
 ```
 
-Click the "see recommendations →" button to advance to stage 3.
+  ┃ "That is not a mock. What you just watched is the actual model reasoning against real numbers."
 
-  ## Stage 3 — Decision (5:00–6:00)
+  The money-shot line is the one you nail verbatim. Rehearse it until it lands the same way every time.
 
-You land on `app/investigate/[id]/recommend/page.tsx`. The stepper advances. The recommendation agent runs with the diagnosis handed over from stage 2. The trace column lights up again. The left column paints `RecommendationCard`s — each with a Bloomreach feature chip (`scenario` / `segment` / `campaign` / `voucher` / `experiment`), a confidence dot, a rationale, numbered steps, and a highlighted **expected impact** callout.
+  ## Beat 2 — the recommendation (3:00–4:00)
 
-| SHOW (on screen)                                                | SAY (out loud)                                              |
-|-----------------------------------------------------------------|-------------------------------------------------------------|
-| Stepper now shows stage 3 active. New trace begins right column. | "stage three — the **recommendation agent**. It takes the diagnosis and proposes a Bloomreach action you can actually take." |
-| First recommendation card paints: feature chip `voucher`, title, rationale, numbered steps, expected impact callout glowing. | "it's not 'do something about it.' It's a specific Bloomreach feature, the steps to build it, and an expected impact backed by the segment size from stage 2." |
-| Second card paints below: `scenario`. | "and it offers more than one — different feature surfaces, different confidence levels — because the marketer is the one who picks." |
-
-You are at roughly 5:45. Pause. Look at the room.
+  A quick beat. Click through, let the RecommendationCards render, name the "expected impact" callout. Do not linger — the room is still processing the money shot, and this beat is the payoff, not a second climax.
 
 ```
-  ┃ "Three stages. Three agents. One streamed trace the whole way
-  ┃  through. That's the loop."
+  SHOW (on screen)                    SAY (out loud)
+  ────────────────────────            ──────────────────────────
+  click "see recommendations →"       "the third agent takes the
+                                       diagnosis and turns it into a
+                                       Bloomreach action —"
+  ────────────────────────            ──────────────────────────
+  RecommendationCards render          "— a scenario, or a segment,
+  with feature chip, confidence       or a campaign. each carries
+  dot, numbered steps, expected       a confidence level and an
+  impact callout                      expected impact. it doesn't
+                                       just tell you what happened.
+                                       it tells you what to do about
+                                       it."
+  ────────────────────────            ──────────────────────────
 ```
 
-Then hand off to chapter 03 with: *"that's what it does — here's the one thing under the hood worth ten seconds."*
+  ┃ "It doesn't just tell you what happened. It tells you what to do about it."
 
-  ## The IF-IT-BREAKS box — stage 1 fails to stream
+  ## Beat 3 — the fault-injection side quest (4:00–5:00)
 
-╔══════════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                                       ║
-║ The trace column is dead at 1:30 — no events painting, no tool     ║
-║ calls. The synthetic data source is choking, the model call is     ║
-║ timing out, or the dev server crashed.                             ║
-║                                                                    ║
-║ → Switch the mode toggle to `demo`. The committed snapshot serves  ║
-║   instantly. Same screen, same card, same trace — replayed at      ║
-║   140ms intervals so it still LOOKS like it's painting.            ║
-║ → Say: "let me show you a run from earlier — same workspace, same  ║
-║   data, same trace" and keep the same SAY track running.           ║
-║ → The room cannot tell the difference. The demo snapshot is real   ║
-║   captured agent output, not a mockup.                             ║
-║ → DO NOT try to restart the dev server on stage. DO NOT explain    ║
-║   the network. Switch. Move. Keep going.                           ║
-╚══════════════════════════════════════════════════════════════════╝
+  This is where you shift from "look at the product" to "look at the receipts behind the product." You cmd-tab to a terminal that already has the command pre-typed. This detail matters — typing live is a stumble tax you cannot afford.
 
-  ## The IF-IT-BREAKS box — stage 2 or 3 hangs
+```
+  SHOW (on screen)                    SAY (out loud)
+  ────────────────────────            ──────────────────────────
+  cmd-tab to terminal, command        "one quick side-quest —
+  pre-typed:                          because judges always ask
+                                       'yeah but does it handle
+   LOAD_N=5 FAULT_TIMEOUT=0.1 \       failure?'"
+   FAULT_MALFORMED_JSON=0.1 \
+   FAULT_SEED=42                      
+   npm run eval:load
+  ────────────────────────            ──────────────────────────
+  press Enter                         "i'm injecting a 10% timeout
+                                       rate and a 10% malformed-JSON
+                                       rate into the DataSource
+                                       seam. seeded PRNG, so this is
+                                       replayable."
+  ────────────────────────            ──────────────────────────
+  output scrolls; fault-injection     "the agent loop presents each
+  annotations visible; final line:    fault to the model as a tool
+  "9 faults injected,                 error. the model reads it,
+  3/3 investigations succeeded"       reasons around it, retries or
+                                       pivots. that's not error
+                                       handling — that's the model
+                                       negotiating with failure."
+  ────────────────────────            ──────────────────────────
+```
 
-╔══════════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                                       ║
-║ Stage 1 worked, but clicking the card lands on a spinner that      ║
-║ never resolves (the agent route timed out, or `useInvestigation`   ║
-║ is stuck mid-stream).                                              ║
-║                                                                    ║
-║ → Hit back. Open a SECOND card on the feed instead. Different ID,  ║
-║   different request, usually unblocks.                             ║
-║ → If that also hangs: switch the toggle to `demo` and click the    ║
-║   same card. The committed snapshot path runs the SAME replayed    ║
-║   investigation, filtered to the step, NDJSON streamed at 140ms.   ║
-║ → Say: "let me grab one I ran earlier" — once. Then keep going.    ║
-╚══════════════════════════════════════════════════════════════════╝
+  ┃ "That's not error handling. That's the model negotiating with failure."
+
+  ## Beat 4 — the eval:report closing punch (5:00–5:45)
+
+  The final punch is a table. You have said the trace is real. You have said the receipts are real. Now you show the numbers.
+
+```
+  SHOW (on screen)                    SAY (out loud)
+  ────────────────────────            ──────────────────────────
+  terminal:  npm run eval:report      "and this is what those runs
+                                       cost."
+  ────────────────────────            ──────────────────────────
+  table renders — per-phase           "per-phase p50, p95, p99
+  p50/p95/p99, per-case cost,         latency, per-case cost around
+  cost breakdown from                  nine cents. the numbers you're
+  eval/receipts/                       looking at are from the eval
+                                       receipts committed to the
+                                       repo. not aspirational."
+  ────────────────────────            ──────────────────────────
+```
+
+  ┃ "The numbers you're looking at are from the eval receipts committed to the repo. Not aspirational."
+
+  Hand off to Chapter 03. Do not close on the terminal — pivot to the diagram.
+
+  ## Strong vs weak — the narration failure
+
+  This is the second most common demo failure, right after the cold-open one. Judges have watched it a hundred times. Do not do it.
+
+```
+  ┌── weak (do not) ───────────────┬── strong (do this) ────────────┐
+  │                                 │                                 │
+  │ "so I'm clicking here on the    │ "the monitoring agent ran a     │
+  │  top card, and now it's         │  period-over-period scan and    │
+  │  loading — you can see the      │  flagged three changes it       │
+  │  spinner — and now the page     │  thinks matter."                │
+  │  is loading, and here we go,    │                                 │
+  │  and — okay so now on the       │ "now the diagnostic agent is    │
+  │  right you can see the panel    │  forming hypotheses. what you   │
+  │  and it's streaming stuff…"     │  see on the right is the actual │
+  │                                 │  model output — each tool call  │
+  │  the SAY track is describing    │  runs EQL against the workspace"│
+  │  the SHOW track; the room       │                                 │
+  │  learns nothing new             │  the SAY track is talking about │
+  │                                 │  what the product IS while the  │
+  │                                 │  hands do the clicking          │
+  │                                 │                                 │
+  └─────────────────────────────────┴─────────────────────────────────┘
+```
+
+  The rule: the SAY track never describes the SHOW track. They run in parallel — the SAY track speaks value while the hands do the clicking. Narrating clicks makes a demo feel like a tutorial.
+
+  ## IF IT BREAKS — three recovery boxes for three failure points
+
+  The demo has three places it can fail live. Each has its own backup. Rehearse each one.
+
+```
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║ IF IT BREAKS — the investigation trace stalls                      ║
+  ║                                                                    ║
+  ║ StatusLog stops streaming for >10s after clicking the card:        ║
+  ║   → do NOT click the card again                                    ║
+  ║   → say: "let me pull up the run I captured earlier — this one is  ║
+  ║      identical, same data"                                         ║
+  ║   → toggle mode to `demo` (top-right); the snapshot replays        ║
+  ║      instantly from `lib/state/demo-investigations.json`           ║
+  ║   → the replay is real captured events, filtered per step          ║
+  ║   → keep SAY track identical from this point on                    ║
+  ║                                                                    ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║ IF IT BREAKS — the fault-injection side quest fails                ║
+  ║                                                                    ║
+  ║ eval:load doesn't produce clean output (missing deps, node error): ║
+  ║   → say: "here's the receipt from the last run I did"              ║
+  ║   → have a screenshot open in a second monitor / second tab:       ║
+  ║      `eval/load-receipts/latest.txt` — a real receipt from a       ║
+  ║      previous run showing "9 injected faults / 3 investigations /  ║
+  ║      0 failures"                                                   ║
+  ║   → the receipt is in the repo; not slideware                      ║
+  ║                                                                    ║
+  ║ Cut the side-quest entirely if it fails twice — never a third try  ║
+  ║                                                                    ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║ IF IT BREAKS — the eval:report table fails                         ║
+  ║                                                                    ║
+  ║ eval:report throws or renders empty:                               ║
+  ║   → say: "the receipts from the last committed run —"              ║
+  ║   → cat the file directly:  cat eval/baseline.json | head -40      ║
+  ║   → point at `perDimensionPassRate` and per-phase timings          ║
+  ║   → close on: "these are the numbers, committed to the repo"       ║
+  ║                                                                    ║
+  ╚══════════════════════════════════════════════════════════════════╝
+```
 
   ## The "tighten it" cut
 
-If you are running long out of stage 1 (you'll know — the money shot landed at 2:45 instead of 2:30, and you're at 4:00 still on the feed), **cut stage 3 entirely.** Skip the recommendation walkthrough. End on stage 2: "I'd show you the recommendation it proposes next, but you've already seen the loop — what changed, why, what to do — and the third agent is the 'what to do.'" The room got the differentiator at the money shot; stage 3 is reinforcement, not the point.
-
-Floor for the demo: **the room must see the streaming trace paint into a real card.** Stages 2 and 3 are cuttable. Stage 1 plus the money shot is not.
-
-Strong-vs-weak side-by-side for the cut decision:
+  If Chapter 01 ran long and you enter this chapter behind clock, cut in this order.
 
 ```
-  WEAK CUT                              STRONG CUT
-  ────────────────────────────────      ───────────────────────────────
-  rush through stage 3 in 30s,          end clean at stage 2,
-  miss the expected-impact callout,     acknowledge stage 3 in one
-  swallow the closing line              line, hand to under-the-hood
-                                        on schedule
-  → room sees a chaotic finish to       → room sees a confident
-    the demo, and you eat into            choice. Same content
-    chapter 03's budget                   coverage. Better pacing.
+  Running long — drop these beats, in this order:
+
+    1. drop the RecommendationCard beat (Beat 2).
+       skip the click on "see recommendations →"; stay on the
+       diagnosis page and pivot to the terminal.
+       cost: 60 seconds saved. keeps the money shot intact.
+
+    2. drop the eval:report closing punch (Beat 4).
+       stop at "9 faults injected, 3/3 succeeded" and hand off.
+       cost: 45 seconds saved. weakens the close but keeps
+       the fault receipt.
+
+    3. drop the fault-injection side quest (Beat 3).
+       cut straight from money shot to Chapter 03.
+       cost: 60 seconds saved. this is your last cut — after
+       this you are cutting into the demo floor.
+
+  Floor:
+    → the money shot must land. the room must see the agent
+      reason live. everything else is negotiable; the money
+      shot is not.
 ```
 
-  ## The one-page run sheet — the demo
+  ## One-page run sheet — the demo
+
+  This is what you hold on stage during the five-minute centerpiece.
 
 ```
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ RUN SHEET — 02 THE DEMO                    1:00–6:00 (5 minutes) │
-  │                                                                  │
-  │ STATE BEFORE: browser on localhost:3000, mode = live-synthetic,  │
-  │               feed NOT yet loaded (will paint on click)          │
-  │               second tab: same URL, mode = demo (warm fallback)  │
-  │                                                                  │
-  │ STAGE 1 — monitoring (1:00–3:30)                                 │
-  │   1:00   click reload / mode toggle to kick the briefing fetch   │
-  │   1:00–2:30  trace paints; narrate value, NOT the clicks         │
-  │   ★ 2:30  MONEY SHOT — first card paints; say:                   │
-  │             "that's it. An analyst that shows its work."         │
-  │   2:30–3:30  second card paints; let the trace keep scrolling    │
-  │                                                                  │
-  │ STAGE 2 — investigation (3:30–5:00)                              │
-  │   3:30   click the USA card                                      │
-  │   3:30–4:30  diagnostic trace paints; evidence panel builds      │
-  │   4:30   point at "hypotheses considered" — including misses     │
-  │   5:00   click "see recommendations →"                           │
-  │                                                                  │
-  │ STAGE 3 — decision (5:00–6:00)                                   │
-  │   5:00–5:45  recommendation trace paints; cards paint left       │
-  │   5:45   "three stages, three agents, one streamed trace"        │
-  │          → hand off to chapter 03                                │
-  │                                                                  │
-  │ NAIL THIS:  the money shot at 2:30. "An analyst that shows       │
-  │             its work."                                           │
-  │ IF BREAKS:  switch mode toggle to `demo` in the other tab.       │
-  │             Same screen, same trace. No apology.                 │
-  │ TIGHTEN:    cut stage 3. End at stage 2 with one line.           │
-  ╰──────────────────────────────────────────────────────────────────╯
+  ╭─ RUN SHEET · CHAPTER 02 · THE DEMO ─────────────────────╮
+  │                                                          │
+  │  Budget:     1:00–6:00 (5 minutes)                       │
+  │  Money-shot marker:  ~2:30 (diagnostic conclusion        │
+  │                       renders + hypotheses fill)         │
+  │                                                          │
+  │  Pre-flight (before slot starts):                        │
+  │    → localhost tab on feed page, mode = live-synthetic   │
+  │    → terminal pane 1: command pre-typed for eval:load    │
+  │    → terminal pane 2: eval:report ready                  │
+  │    → screenshot of load receipt open in second monitor   │
+  │                                                          │
+  │  Click-path:                                             │
+  │    1:00  click top anomaly card (critical / usa)         │
+  │    1:15  wait — StatusLog streams the trace              │
+  │    2:30  ★ conclusion + hypotheses render (money shot)   │
+  │    3:00  click "see recommendations →"                   │
+  │    3:30  RecommendationCards render                      │
+  │    4:00  cmd-tab to terminal; press Enter (eval:load)    │
+  │    5:00  run:  npm run eval:report                       │
+  │    5:45  deliver closing line, hand to Chapter 03        │
+  │                                                          │
+  │  The three lines to nail:                                │
+  │    → "that is not a mock. that's the actual model        │
+  │       reasoning against real numbers."                   │
+  │    → "that's not error handling. that's the model        │
+  │       negotiating with failure."                         │
+  │    → "the numbers you're looking at are committed to     │
+  │       the repo. not aspirational."                       │
+  │                                                          │
+  │  IF IT BREAKS (any beat):                                │
+  │    → trace stall → toggle mode to `demo`, snapshot       │
+  │       replays instantly, keep SAY identical              │
+  │    → eval:load fails → open receipt screenshot           │
+  │    → eval:report fails → cat eval/baseline.json head     │
+  │                                                          │
+  │  Tighten-it (in order):                                  │
+  │    1. drop RecommendationCards beat (−60s)               │
+  │    2. drop eval:report closing (−45s)                    │
+  │    3. drop fault-injection side quest (−60s)             │
+  │                                                          │
+  │  Floor:                                                  │
+  │    → the room must see the agent reason live.            │
+  │       everything else is negotiable.                     │
+  │                                                          │
+  ╰─────────────────────────────────────────────────────────╯
 ```

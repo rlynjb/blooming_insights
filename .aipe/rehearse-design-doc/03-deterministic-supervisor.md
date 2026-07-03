@@ -1,136 +1,89 @@
-# RFC 03 — Deterministic supervisor, not an LLM router
+# RFC-03 — Deterministic supervisor, not LLM router
 
-**One-line summary.** The pipeline is a fixed sequence — monitoring → diagnostic → recommendation — driven by route code, not a "supervisor agent." The free-form Q&A surface uses a one-shot intent classifier (haiku) as a deterministic ROUTE step, not as a planner.
+**Decision in one line:** The order agents run in — monitoring → diagnostic → recommendation — and the classifier that routes a chat message to `query` vs `investigate` are both plain TypeScript. No LLM decides which agent runs next.
 
 ---
 
 ## Context
 
-The product has four agents: `monitoring`, `diagnostic`, `recommendation`, and `query`. The textbook AI-engineering move when you have N agents is to add an N+1th — a "supervisor" or "coordinator" agent — that takes the user's request, decides which agent to call, hands off context, and decides when to stop. LangGraph, CrewAI, AutoGen, and most "multi-agent" tutorials show this shape.
+Multi-agent products in 2025 tend to open with a "supervisor" LLM that decides which sub-agent to hand a task to. The pattern is seductive: give the model a menu of specialists, let it pick, and it feels like the system is thinking. The failure modes are also well-documented — the supervisor gets a fifth of the load-bearing decisions wrong, cascades context between agents unnecessarily, and turns latency + cost into a lottery.
 
-This repo deliberately does not do that. The constraints that drove the choice:
+blooming insights has a fixed workflow. The user does one of exactly two things:
 
-- **The sequence is fixed by the product.** Step 1 of the UI is monitoring (the feed). Step 2 is diagnostic (investigate one anomaly). Step 3 is recommendation (decide on action). The stepper enforces it; the user clicks through it; the URL reflects it. There is no "agent decides whether to investigate or recommend next" — the human decides, by clicking.
-- **Each agent IS a Claude+tool-use loop already.** The intra-agent control is LLM-driven (the model picks the next EQL query); the inter-agent control does not need to be. Asking a model to decide "should I run diagnostic now?" is asking it to do something the URL already encoded.
-- **The alpha MCP server is rate-limited and revokes tokens.** Every extra LLM call costs latency budget AND a chance to fail. An LLM router would add a Claude round-trip before each agent — pure overhead in the hot path.
-- **The free-form Q&A surface is the one place ambiguity is real.** "What's my purchase rate this week?" vs "Why did checkout drop?" want different agents. That's a one-shot classification, not a multi-step plan.
+1. Land on the feed → the app runs the monitoring pipeline → shows anomalies
+2. Click an anomaly → the app runs diagnostic → offers "see recommendations →" → user clicks → runs recommendation
+
+Or they type in the chat box, where the answer is either "this is a live workspace question" (route to query agent) or "this looks like an anomaly to investigate" (route to a diagnostic run).
+
+The supervisor's actual job is small: two branch points, both with clear rules a human could write down.
 
 ---
 
 ## Decision
 
-**Two pieces, both deterministic in the orchestration layer:**
+The supervisor is code. Two pieces:
+
+1. **The pipeline** — sequential agent execution baked into the route handlers. `/api/briefing` runs monitoring. `/api/agent?step=diagnose` runs diagnostic. `/api/agent?step=recommend` takes the diagnosis and runs recommendation. The `step` query param is the ROUTE.
+2. **The intent router** — for free-form chat, `lib/agents/intent.ts` uses the cheap Haiku classifier (`claude-haiku-4-5-20251001`) to label the message as `query` vs `investigate` — but the LLM only labels; the code branches. The classifier is scoped to text classification, not tool orchestration.
 
 ```
-  Two control planes — both deterministic at the outer layer
+The supervisor is code, not an LLM
 
-  ┌─ The pipeline (investigation flow) ──────────────────┐
-  │                                                       │
-  │  app/api/agent/route.ts is the supervisor             │
-  │                                                       │
-  │  step=diagnose  →  DiagnosticAgent.investigate()     │
-  │                       (Claude loop, model picks       │
-  │                        EQL queries)                   │
-  │  step=recommend →  RecommendationAgent.propose()      │
-  │                       (Claude loop, model decides     │
-  │                        which actions to suggest)      │
-  │                                                       │
-  │  Order: ROUTE CODE                                    │
-  │  Each step: LLM + TOOLS                               │
-  │                                                       │
-  └───────────────────────────────────────────────────────┘
-                                          ▲
-                              the seam: who decides flips
-                                          ▼
-  ┌─ The Q&A surface (free-form questions) ──────────────┐
-  │                                                       │
-  │  classifyIntent(q) → 'analytical' | 'diagnostic' |    │
-  │                      'recommendation' | 'general'     │
-  │                                                       │
-  │  Haiku one-shot, no tools                             │
-  │  Output IS the route — passed to QueryAgent which     │
-  │  picks behavior from intent                           │
-  │                                                       │
-  │  This IS the LLM router — bounded to a single         │
-  │  classification, never re-entered                     │
-  └───────────────────────────────────────────────────────┘
+  ┌─ user action ────────────┬─ ROUTE decides ──────────┬─ agent runs ────┐
+  │ land on feed             │ /api/briefing            │ monitoring       │
+  │                          │ (no branch)              │                  │
+  ├──────────────────────────┼──────────────────────────┼──────────────────┤
+  │ click anomaly            │ /api/agent               │ diagnostic       │
+  │                          │ ?step=diagnose           │                  │
+  ├──────────────────────────┼──────────────────────────┼──────────────────┤
+  │ click "see recs →"       │ /api/agent               │ recommendation   │
+  │                          │ ?step=recommend          │                  │
+  ├──────────────────────────┼──────────────────────────┼──────────────────┤
+  │ type in QueryBox         │ intent.ts labels        │ query OR         │
+  │                          │ (Haiku · classification) │ diagnostic       │
+  │                          │  → switch(label)         │                  │
+  └──────────────────────────┴──────────────────────────┴──────────────────┘
+
+  where control flows:
+  · pipeline order  → CODE decides (fixed by ?step)
+  · intent routing  → CODE decides (a switch on the Haiku label)
+  · within an agent → LLM decides (ReAct loop chooses tools freely)
 ```
 
-**Inside `app/api/agent/route.ts`**, the orchestration is literally an `if/else`:
-
-```
-  app/api/agent/route.ts — the deterministic switch
-
-  if (q && !insightId) {                      // free-form Q&A
-      intent = classifyIntent(q)              // one Haiku call
-      answer = QueryAgent.answer(q, intent)   // one agent loop
-      done
-  }
-
-  if (step !== 'recommend') {                 // run diagnostic
-      diagnosis = DiagnosticAgent.investigate(anomaly)
-      emit('diagnosis', diagnosis)
-  }
-
-  if (step !== 'diagnose') {                  // run recommendation
-      recs = RecommendationAgent.propose(anomaly, diagnosis)
-      emit('recommendation', rec) for each
-  }
-
-  emit('done')
-```
-
-The "supervisor" is the route handler. The control axis (who decides what runs next?) is *code* at the outer layer and *LLM* inside each agent loop. That's the seam this RFC is built on.
-
-**The intent classifier** is a single call to `claude-haiku-4-5-20251001` (`lib/agents/intent.ts:33`) — cheapest model, no tools, returns one of four enum values. It runs once per Q&A submission and its output is the route. There's no "did I classify right? let me reclassify" loop. If it picks wrong, the user sees the wrong agent's answer and re-asks.
+The seam is deliberate: **outer control is code, inner control is LLM.** The route handler enforces order; the ReAct loop inside each agent picks tool calls freely.
 
 ---
 
 ## Alternatives considered
 
-### LLM supervisor agent (the popular pattern)
+**(a) Supervisor LLM as an outer agent.** A "coordinator" agent that receives the anomaly and decides whether to call `diagnose` or `recommend` or skip. Loses because the ordering is knowable at ROUTE time — the user's click already carries the decision. Handing that to an LLM adds a model turn, one more class of failure (the supervisor picks the wrong sub-agent), and no capability that isn't already handled by the `step` param.
 
-A `coordinator` agent that takes the user's intent and decides — per turn — which sub-agent to invoke. LangGraph's tutorial shape.
+**(b) Full LLM router for chat (no classifier).** Give the query agent the diagnostic tools too and let it decide. Loses because the query and diagnostic agents have different system prompts, different tool subsets, and different cost profiles. A user asking "how many customers do we have?" should get one Haiku classification call + a cheap query answer — not a full diagnostic ReAct loop that eventually decides to just answer the question. The classifier is $0.0001; the wrong-agent penalty is $0.10.
 
-**Why it lost.** Three reasons:
-
-1. **The order is already encoded in the UI.** The stepper IS the supervisor. Putting a model behind the stepper to "decide what to do next" would be asking it to read the URL and report it back. That's a constant function with extra steps.
-2. **Latency cost.** Each supervisor turn is a Claude call. Under the alpha server's ~1 req/s MCP cap, every saved round-trip is real. Live investigations run ~100–115s already; adding 1–3 supervisor calls pushes against the 300s Vercel ceiling.
-3. **Failure surface.** A supervisor LLM that hallucinates "run recommendation first" breaks the product (recommendation requires a diagnosis as input). The deterministic path makes that impossible — the type system enforces it.
-
-### Sequential pipeline, no Q&A surface
-
-Drop the free-form Q&A. The product is the three-step flow, full stop.
-
-**Why it lost.** The Q&A surface (`QueryBox`, free-form "ask anything about your workspace") is a real product feature, not optional. It's how a user follows up — "got it, but what about returning customers specifically?" Without it the product is a static report.
-
-### Rule-based intent classifier (regex / keyword)
-
-Skip the haiku call. Match "why" → diagnostic, "what" → analytical, "should I" → recommendation.
-
-**Why it lost.** Tried implicitly (it's the obvious baseline). Real questions don't sort by keyword: "What's behind the conversion drop?" is a why-question with no "why." A 200ms haiku call buys real classification quality for a cost the product can absorb easily — it's one call per question, not per turn.
+**(c) Two chat endpoints (no classification at all).** Force the UI to expose "ask" and "investigate" as separate buttons. Loses on UX — the user often doesn't know which one they mean until they read the answer. The classifier turns that ambiguity into a routing decision the system can make correctly ~95% of the time (Haiku's classification accuracy on the calibration set), which is far better than making the user guess.
 
 ---
 
 ## Consequences
 
-**What this cost — owned, not apologized for:**
+**What this buys:**
+- **Predictable latency and cost.** The per-phase p50 numbers in the baseline (diagnose 50s · d-judge 38s · recommend 51s · r-judge 90s · total 225s) are reproducible because the pipeline is fixed. A supervisor LLM would add variance from a routing turn that isn't in the current budget.
+- **The deterministic failure story is short.** When the pipeline breaks, you know exactly which of two branch points did it (the route or the intent classifier) — not "somewhere in the supervisor's reasoning trace." Debugging is grep-able.
+- **The evals are meaningful.** The regression gate (RFC-10) evaluates diagnostic + recommendation output quality. Because the pipeline order is fixed, "diagnosis quality" is a stable target — no confounding variable from a supervisor rerouting the workload between runs.
 
-- **The pipeline can't reorder itself.** If diagnostic discovers "actually, this is a recommendation-shaped problem," it can't pivot. The user has to back up and click again. The product's shape (three discrete steps the user navigates) makes that fine; a different product (chat-shaped, open-ended) would fight this hard.
-- **Adding a new agent means editing the route file.** There's no plugin shape — you can't drop in a fifth agent and have the supervisor "discover" it. Every new agent is a code change at the supervisor seam. That's the cost of *being* the supervisor in code. For five agents today it's a feature; for fifty it would be debt.
-- **The intent classifier is a single point of failure for Q&A.** If haiku is down, Q&A is down. The investigation pipeline keeps working (no classifier in that path). A future hardening would fall back to a keyword classifier on Haiku failure, accepting the worse quality for the availability.
+**What it costs:**
+- **New agents are code changes, not config.** Adding a fourth agent means adding a new route or a new `step` value. This is fine at 3 agents; it would get repetitive at 20. The pattern doesn't scale to a large agent zoo.
+- **The intent classifier can misclassify.** A phrase like "why is checkout dropping in Germany" could route either way. The current code treats classification failures as "route to query" (safe fallback — cheap and answers most questions). If misclassification becomes a real UX complaint, the fix is not "add a supervisor LLM," it's "improve the classifier prompt with calibration data."
+- **No dynamic re-planning mid-flight.** A supervisor LLM could notice mid-run that the diagnostic is going the wrong way and re-route. This one can't. In practice the ReAct loop inside the diagnostic agent handles this — the LLM within an agent picks tools freely, so re-planning happens one altitude down.
 
-**What this bought:**
+**What the reviewer will push on:**
+> "You don't have real multi-agent orchestration. This is just three agents behind a switch statement."
 
-- **Cheap, fast, debuggable orchestration.** The control flow is in one file (`app/api/agent/route.ts`). When something runs wrong order, you read the route. There's no graph state, no message bus, no tool-use loop to step through.
-- **Type safety across agent boundaries.** `DiagnosticAgent.investigate` returns a `Diagnosis`; `RecommendationAgent.propose` requires one. The compiler enforces what the supervisor LLM would have had to learn from the prompt.
-- **The Claude usage is honest.** Every Claude call is doing real work — running a tool-use loop inside one agent. No call is spent on "deciding what to do next" when the URL already said. The token bill maps cleanly to product features.
-- **Each agent is independently testable.** No supervisor mock needed; tests construct an agent with a fake `DataSource` and exercise its loop directly. The 24-test suite (221 tests, all passing) covers each agent's behavior without ever instantiating a coordinator.
+Own the framing. The answer is: exactly. The supervisor pattern earns its complexity when the routing decision is genuinely hard (unknown workload, dynamic tool availability, agents whose costs vary by an order of magnitude at runtime). None of that applies here. A switch statement is the right primitive for a routing problem with three known branches. Reaching for an LLM supervisor when a switch works is architecture theater.
 
 ---
 
-## Open Questions
+## Open questions
 
-- **Does a fifth agent change the calculus?** Today's five (monitoring, diagnostic, recommendation, query, plus the intent classifier as a one-shot) are linear in the route file. A sixth that needs to interleave with diagnostic — say, a "cohort segmentation" agent that diagnostic might want to call mid-investigation — would break the linear shape. At that point the question is "promote to LLM supervisor, or add a structured sub-pipeline?" Today's answer would be sub-pipeline; that may change.
-- **Should the intent classifier emit confidence?** Today it returns a label. A confidence score would let the route fall back to "ask the user to clarify" on low confidence instead of routing to the wrong agent. Cheap to add (the haiku response already has logprobs); only worth it once a quality bar makes "ask again" preferable to "guess and answer."
-- **Where is the seam if this gets ported to a different framework?** The "supervisor is route code" depends on Next.js route handlers being a comfortable place to write orchestration. If this moved to a worker-queue shape, the supervisor would migrate to the worker entry point — still deterministic, still code, just a different file. The pattern survives the move.
+- **When would we add a supervisor LLM?** Concrete trigger: the day the app has ≥6 agents whose applicability depends on the workspace's data shape (e.g. "this workspace has recommender-service data, so run the recommender-quality agent"). At that point the routing decision becomes hard enough to earn a model turn.
+- **Should the intent classifier see conversation history?** Today it labels the single incoming message. Multi-turn context would help ambiguous follow-ups ("and what about mobile?") — but adds prompt tokens on the hottest path (every chat message). Deferred until we have a real accuracy problem to solve.

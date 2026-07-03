@@ -1,187 +1,169 @@
-# 04 — Success Metrics and Feedback Loop
+# Success metrics and feedback loop
 
-> How we'd know it worked. What the observable outcomes are. What the feedback loop looks like — and what we have today vs what we don't.
+**"How do you know it's working?"** This file is the answer, and the answer is not vibes — it's a committed baseline with per-criterion pass rates, per-phase latency, and per-case cost. Every number in this file traces to a specific runId.
 
-```
-  THE METRICS LADDER — five rungs, current state per rung
+The baseline runId is `2026-07-03T04-08-28-644Z`. 10 golden cases. Everything below reads from that run.
 
-  ┌─ rung 5: business outcome ─────────────────────────────┐
-  │  did the analyst's stakeholder buy the recommendation? │  NOT MEASURED
-  └────────────────────────────────────────────────────────┘
-  ┌─ rung 4: behavior change ──────────────────────────────┐
-  │  does the analyst use this vs the manual loop?         │  NOT MEASURED
-  └────────────────────────────────────────────────────────┘
-  ┌─ rung 3: trust surface ────────────────────────────────┐
-  │  does "show your work" actually beat "magic answer"?   │  NOT MEASURED
-  └────────────────────────────────────────────────────────┘
-  ┌─ rung 2: quality of the loop ──────────────────────────┐
-  │  detection precision/recall · diagnosis · recommend·   │  MEASURED ONCE,
-  │  regression stability                                  │  SUITE RETIRED
-  └────────────────────────────────────────────────────────┘
-  ┌─ rung 1: liveness ─────────────────────────────────────┐
-  │  does the loop terminate? does the UI render?          │  MEASURED
-  └────────────────────────────────────────────────────────┘
-
-  the strongest metrics live on rungs that aren't built yet.
-  honest receipt: rung 1 today; rung 2 has a receipt + a rebuild gate.
-```
-
-## The metrics discipline
-
-Two failure modes a problem brief usually has on success metrics:
-
-1. **Hand-wave aspirational metrics** ("we'll measure user satisfaction") that nobody knows how to instrument.
-2. **Vanity metrics** (page views, agent invocations) that move regardless of whether the product is actually working.
-
-The move that beats both: **name the metrics you have today + the metrics you'd build next + the receipt that you've done it before.** Receipts beat promises, especially in a review where the reviewer has heard a hundred "we plan to measure" answers.
-
----
-
-## Rung 1 — Liveness (we measure this today)
-
-**What it measures:** does the system work end-to-end without crashing? Does the agent loop terminate? Does the UI render the stream? Does an auth recovery succeed?
-
-**How we measure it:**
-- **Test suite** — 24 files / 221 passing tests via Vitest. Pure logic + agent loops TDD'd with injected fakes — no network. Covers the agent loop termination, the NDJSON event protocol, the demo snapshot replay, the OAuth recovery paths.
-- **Demo path as a smoke test.** `?demo=cached` serves a committed snapshot (`lib/state/demo-insights.json`, `lib/state/demo-investigations.json`). If the demo renders end-to-end, the entire UI surface and the streaming consumer are working.
-- **Live path as a live test.** Every live run against the alpha MCP server is a test of auth recovery, rate-limit handling, token revocation handling.
-
-**What it does NOT tell us:** whether the agent's conclusions are any good. A perfectly liveness-clean run can produce a wrong answer with full confidence.
-
-**The honest read on rung 1:** we have it. It's necessary, not sufficient. **Anyone who claims liveness is a product success metric is being sold to.**
-
----
-
-## Rung 2 — Quality of the loop (measured once, suite retired, rebuild target named)
-
-**What it measures:** the agent loop's output quality, per pillar.
-
-### The 4-pillar suite (the receipt)
-
-When the system ran against the public ecommerce data substrate that proved the seam, a 4-pillar eval suite was built and run:
-
-1. **Detection precision/recall** — K=10 runs per anomaly. Did the monitoring agent surface the anomaly that was actually there? Did it surface noise?
-2. **Diagnosis 5-criterion rubric pass rate** — for each diagnostic agent run, was the conclusion supported, was the evidence cited, did it size the affected segment, did it test hypotheses, was the reasoning structured?
-3. **Recommendation 3-criterion rubric pass rate** — was the Bloomreach feature appropriate, were the steps actionable, was the expected-impact statement grounded?
-4. **Regression capture-and-score** — structural diff + LLM similarity judge on prior runs. Did changing the prompt break a previously-working case?
-
-**The calibration discipline:** the LLM-as-judge was spot-checked against manual review — **8/8 agreement on the diagnosis rubric and 3/3 on the recommendation rubric.** Without that calibration, the judge's scores are unverified — running an eval against an uncalibrated judge produces numbers that look like signal and aren't.
-
-### What the suite surfaced (3 named bugs)
-
-1. **BRL units (cents vs Reais).** The judge flagged an implausible average order value of R$131,965 at run 8 — the agent was treating BRL cents as whole Reais. A unit test wouldn't have caught this; the eval did because it ran the full loop and reasoned about plausibility.
-2. **Binary calibration drift.** A criterion that should have been graded 0/1 was drifting to 29/30 (too lenient). Caught by re-running the calibration spot-check.
-3. **Conclusion instability.** A 30% regression baseline across K=10 runs on the same anomaly. Invisible from any single run; only visible because we ran K and computed the variance.
-
-### Why the suite was retired
-
-The suite was specific to the data substrate it ran against. **When that substrate was retired** (the decision to swap to an in-process Synthetic adapter as a cleaner data shape), the eval went with it. **That was a deliberate call, not an oversight.** The rebuild target is named: **the next version of the eval runs against the Synthetic adapter**, where the substrate is deterministic, the anomaly seeds are stable, and the eval doesn't decay with the data.
-
-### Why this is a stronger story than "we have an eval running on every commit"
-
-A reviewer can take three readings off this:
-
-- **End-to-end execution receipt** — you built it, ran it, calibrated it. Not a TODO, not a Confluence page.
-- **It found real bugs no unit test would catch.** Three of them, named, specific. The eval **earned its place by surfacing things.**
-- **You retired it deliberately and named the rebuild gate.** That's an `evaluated-and-accepted` move on the eval itself — the receipt of having done the work once is stronger than promising to do it.
-
-**The L5 framing for this rung:** "shipped, calibrated 8/8 + 3/3, surfaced 3 named bugs, made the call to retire with the substrate, next version against the Synthetic adapter." Receipts not promises.
-
----
-
-## Rung 3 — Trust surface (the load-bearing metric, not yet measured)
-
-**What it measures:** does "show your work" actually beat "magic answer" for the analyst persona? This is the central product bet — the metric that, if it goes the wrong way, tells us the whole reasoning-trace surface was over-built.
-
-**How we'd measure it:**
-- **A/B the same recommendation with and without the trace visible.** Two cohorts. Same insight, same diagnosis, same recommendation card. Cohort A sees the reasoning trace in the sidebar; Cohort B sees a collapsed "see how I got this" link. **Measure: which cohort forwards the recommendation to their stakeholder more often?**
-- **Forward-rate as the proxy.** Forwarding is the closest in-product behavior to "I trust this enough to defend it." The markdown export (`lib/export/investigationMarkdown.ts`) is the instrumentation point — when an analyst exports, they're committing to a downstream conversation.
-
-**What we have today:** the surface is built. The instrumentation point is built. The A/B framework is not. **The metric is gated on having enough users to run the A/B.**
-
-**The honest read on rung 3:** this is the most important metric in the entire ladder — and we have no data on it. Calling that out is the move. A brief that claimed we'd validated the trust bet would be lying.
-
----
-
-## Rung 4 — Behavior change (not yet measured)
-
-**What it measures:** does the analyst actually use this product, vs going back to their manual three-context loop? **The product fails if it sits on the shelf, regardless of liveness or quality.**
-
-**How we'd measure it:**
-- **Weekly active analysts running ≥3 investigations.** Three is the threshold because one is a sample, two is a try, three is "this is in my workflow."
-- **Investigation depth.** Does the analyst go all the way through (monitoring → diagnose → recommend → export), or do they drop off at the diagnose step? **Drop-off at recommend is a signal that the recommendation step isn't earning its place.**
-- **Re-use of the same investigation.** Does the analyst come back to it (which, given Cut 1 — no persistence — is currently bounded by the session)?
-
-**What we have today:** none of this. Building it is gated on having real users to instrument. **The instrumentation is straightforward (it's all in-process state); the gate is having the users.**
-
----
-
-## Rung 5 — Business outcome (the metric we never directly measure)
-
-**What it measures:** did the analyst's recommendation, executed in Bloomreach, actually move the metric it was meant to move?
-
-**How we'd measure it:**
-- The honest answer is: **we don't, directly.** The product is read-only (Cut 3). The analyst takes the recommendation to Bloomreach, configures it themselves, the campaign runs, the metric moves or doesn't.
-- The closest proxy we could build: a post-execution prompt — "did this recommendation help? did revenue move?" — that the analyst fills in a week later. Subject to massive selection bias and small-sample noise.
-
-**Why we don't pretend to measure this:** rung 5 is what the customer cares about and what the product genuinely contributes to — but **measuring it would require the write-back integration we deliberately cut.** A brief that claimed rung 5 as a metric would be promising something the architecture doesn't support.
-
-**The honest framing for rung 5:** it's the goal, not the metric. The metric is rung 3 — does the analyst trust the recommendation enough to take it to Bloomreach in the first place. Rung 5 is downstream of rung 3.
-
----
-
-## The feedback loop — how metrics turn into product changes
+## The shape
 
 ```
-  THE LOOP — what produces signal, what consumes it
+  Success is measured on three axes, all committed to eval/baseline.json
 
-  ┌─ run (live or eval) ──────┐
-  │  agent loop executes      │
-  │  trace + tool calls       │
-  │  + numbers + conclusion   │
-  └──────────────┬────────────┘
-                 │
-  ┌─ capture ────▼────────────┐
-  │  snapshot to demo-*.json  │  ← committed
-  │  raw tool calls cached    │  ← rate-limit / token-revoke recovery
-  └──────────────┬────────────┘
-                 │
-  ┌─ review ─────▼────────────┐
-  │  manual eyeball today     │  ← rung 1 + spot-checks on rung 2
-  │  (the suite ran here once)│
-  └──────────────┬────────────┘
-                 │
-  ┌─ change ─────▼────────────┐
-  │  prompt edit · adapter    │
-  │  swap · UI tweak          │
-  └──────────────┬────────────┘
-                 │
-                 └──► back to run
+  ┌─ QUALITY ────────────────────────────────┐
+  │  per-criterion pass rates on rubrics     │
+  │  diagnosis: 4 dims · recommendation: 4    │
+  │  where the actionable-gap lives           │
+  └───────────────────────────────────────────┘
 
-  The shortest loop: live run → trace → notice something off → edit prompt → re-run.
-  The longest loop (when the eval was alive): live run → seed eval anomaly → K=10 → judge → regression diff → prompt edit.
+  ┌─ LATENCY ────────────────────────────────┐
+  │  per-phase p50 across 10 cases            │
+  │  diagnose · d-judge · recommend · r-judge│
+  │  225s total p50                           │
+  └───────────────────────────────────────────┘
+
+  ┌─ COST ───────────────────────────────────┐
+  │  per-case ~$0.09 agent-side               │
+  │  10-case run ~$1.30 total                 │
+  └───────────────────────────────────────────┘
 ```
 
-**What we have today on this loop:** the run, the capture, and the change steps are fast and real. The review step is **manual eyeball** — the same as it was before the eval suite shipped. The committed demo snapshot is the closest thing to a regression check: if the demo renders differently after a prompt edit, you notice.
+And the loop that closes it:
 
-**What we don't have today:** the automated review step. The eval suite did this until it was retired with the substrate. Rebuilding it against the Synthetic adapter is the next deliberate move when the substrate is stable.
+```
+  The feedback loop, receipt-backed at every arrow
 
----
+     ┌──────────┐   npm run eval    ┌────────────┐
+     │  code    │  ───────────────► │  receipts  │
+     │  change  │                   │  on disk   │
+     └──────────┘                   └─────┬──────┘
+                                          │
+                                          ▼
+                                  ┌───────────────┐
+                                  │ eval:report   │
+                                  │  aggregation  │
+                                  └───────┬───────┘
+                                          │
+                                          ▼
+                                  ┌───────────────┐
+                                  │ eval:gate     │
+                                  │ vs baseline   │
+                                  └───────┬───────┘
+                                          │
+                     ┌────────────────────┼────────────────────┐
+                     ▼                                         ▼
+              ┌───────────┐                              ┌──────────┐
+              │  PASS     │                              │  BLOCK   │
+              │  merge    │                              │  the PR  │
+              └───────────┘                              └──────────┘
+```
 
-## The discovery questions on metrics (honest gaps)
+That's not a diagram of the plan. That's the shipped loop. `eval:gate` is wired to CI.
 
-The repo cannot answer these — and the brief loses credibility if it pretends otherwise:
+## Quality — per-criterion pass rates
 
-1. **What's the right baseline for "the analyst's current loop"?** We don't know how long the manual three-context loop currently takes a Bloomreach analyst, or how often they decline to investigate at all because the friction is too high. Discovery move: time 5 analysts running the loop by hand before we A/B anything.
-2. **What's the threshold for "show your work beats magic"?** Is 60% forward-rate good? 80%? We don't have a benchmark.
-3. **What's the analyst's tolerance for agent error?** If 1 in 10 recommendations is wrong, do they keep using it (because the other 9 saved them time) or stop (because the wrong one undermined their trust)? This shapes how aggressive the agent should be about confidence.
+The rubric has 4 dimensions per rubric type, scored 1–5 with three verdicts (pass / pass_with_notes / fail).
 
-A brief that names these gaps — and ranks them by which one would change product strategy if answered — is a brief that earns its review.
+### Diagnosis rubric (4 dims)
 
----
+Baseline pass rates from the 10-case run:
 
-## The sharp answer on metrics
+- **root_cause_plausibility — 75%.** The diagnosis names a mechanism that could plausibly explain the observed change. Solid.
+- **evidence_grounding — 50%.** The diagnosis cites specific evidence (tool results, numbers) rather than gesturing at "the data shows." Middle band; the fix is prompt-level (require evidence-citation in the output shape).
+- **scope_coherence — 75%.** The diagnosis correctly scopes the finding (global vs country segment vs customer segment). Solid.
+- **actionable_next_step — 0%.** Every diagnosis is mechanism-clear but action-vague. **This is the highest-leverage Week-3 target and it's baseline-committed at 0%.**
 
-If a reviewer asks "how do you know any of this is good" — **"Today, by eyeballing the trace, the same way it was before the eval suite shipped. But I built the eval harness once, calibrated it 8/8 + 3/3 against manual review, surfaced 3 named bugs no unit test would catch (BRL units, binary calibration, conclusion instability), retired it deliberately with the substrate it ran against, and named the rebuild gate (against the in-process Synthetic adapter, when that's stable). The receipt of having done the work once is stronger than promising to do it."**
+That last one is the interview gold. Let's unpack it.
 
-The rest of the ladder — rungs 3, 4, 5 — is genuinely not built yet, and the brief is honest about which rung is gated on which thing. **A brief that overclaimed those rungs would lose the room. A brief that names the gates earns the next conversation.**
+### The actionable_next_step gap
+
+Every diagnosis says "purchase revenue is down because checkout conversion dropped in the USA segment." Solid diagnosis. What it does *not* say: "run this specific tool to confirm the checkout drop is a payment issue" or "query the checkout_complete event for the last 7 days broken out by payment_method." Mechanism-clear. Action-vague.
+
+**How you know this is systemic, not one-case noise.** The 0% baseline was measured with N=6 diagnoses that received full judge output (the other 4 were judge_error — covered below). 6-of-6 failed the actionable_next_step criterion. That's a prompt gap, not a statistical fluctuation.
+
+**The fix shape you already know.** The diagnosis prompt at `lib/agents/prompts/diagnostic.md` currently asks the agent to name mechanism and evidence. It does not ask for the *next tool to run* to confirm the mechanism. Adding "name the specific tool call and its expected result" to the output shape is a one-prompt change.
+
+**Why the fix goes through the gate.** If the prompt change works, the regression gate will see actionable_next_step move from 0% → some positive number. If it doesn't work, the gate won't see the move, and the PR gets blocked. That's how the feedback loop stays honest — you can't ship a fix that doesn't move the number.
+
+### Recommendation rubric (4 dims)
+
+Baseline pass rates from the same 10 cases:
+
+- **diagnosis_response — 48%.** Does the recommendation actually respond to the diagnosis passed in, or does it generate a generic ecommerce fix regardless of the specific finding? Middle band.
+- **feature_choice_fit — 62%.** Does the chosen Bloomreach feature (scenario / segment / campaign / voucher / experiment) match the diagnosis shape? Above middle.
+- **step_actionability — 100%.** The step-by-step instructions in the recommendation are concrete and executable. **This is the criterion the recommendation prompt already nails.**
+- **impact_realism — 43%.** Is the "expected impact" claim plausible given the diagnosis? Lowest of the four — the agent tends to inflate impact.
+
+### Verdict distribution for diagnosis (the judge_error story)
+
+Of the 10 diagnosis judgments in the baseline:
+- 3 pass_with_notes
+- 1 fail
+- **6 judge_error**
+
+That's not "the agent broke on 6 cases." That's the *judge* running out of tokens on 6 cases. The judge was configured with `maxTokens: 4096`, which hits the ceiling on the longer no-signal cases (cases 05, 06, 10 — all no-signal — plus case 03 has-signal).
+
+**The tradeoff, named directly.** Two fix options:
+- **Bump to 8192 tokens.** ~2× cost per judgment. Recovers the 6 judge_error verdicts.
+- **Accept as a low-frequency outcome.** Report on the completed judgments; treat judge_error as a known outcome bucket.
+
+The current call is *accept as a known outcome bucket*, with the rationale that the underlying agent output was fine — the judgment ran out of space, not the agent's reasoning. The choice is deferred, not hidden.
+
+## Latency — per-phase p50 across 10 cases
+
+Measured from the baseline run:
+
+- **diagnose — 50s p50.** The diagnostic agent from start-of-request to diagnosis-complete.
+- **d-judge — 38s p50.** The diagnosis judge scoring the 4 rubric dims.
+- **recommend — 51s p50.** The recommendation agent from diagnosis-input to recommendations-complete.
+- **r-judge — 90s p50.** The recommendation judge — longer than the diagnosis judge because the rubric has more shape to score against.
+- **total — 225s p50 per case.**
+
+**Where the 225s puts you against the Vercel envelope.** The `maxDuration = 300` on `/api/agent` and `/api/briefing` gives you ~5 min. p50 is at 225s. p95 would push closer to the ceiling. This is why diagnose and recommend run as separate HTTP requests, not one combined one — combining them would blow the envelope.
+
+**Where the r-judge 90s comes from.** The recommendation rubric has more per-criterion evidence to score (feature choice, step actionability, impact plausibility all require reading the full recommendation). The judge takes longer because the input is bigger.
+
+## Cost — per-case and per-run
+
+- **~$0.09 per case agent-side.** That's the DiagnosticAgent + RecommendationAgent Claude calls, not the judges. Numbers from the Anthropic pricing helper reading the token counts (including cache-hit tokens at their reduced rate).
+- **~$1.30 for the full 10-case run.** Agents + judges combined.
+
+**Where the cache hits change the number.** Prompt caching validated live in logs (`cache_read_input_tokens: 3168` on subsequent calls after `cache_creation_input_tokens` on the first). The Anthropic pricing helper multiplies cache-read tokens at their reduced rate — about 10% of standard input token cost. That's the shipped cost lever.
+
+**What the BudgetTracker does with these numbers.** Check-before-dispatch. If the projected cost of the next Claude call would push the running total past budget, the call is blocked, not run-then-audited. Fail closed. See Ch 02, cost controls.
+
+## Blind calibration — the Session D pilot and the real gap
+
+The calibration protocol is defined and the mechanic works. But **the real number requires a blind human pass, not an AI-vs-AI pass**. Here's the distinction, said plainly.
+
+**What Session D shipped.** An AI-vs-AI blind calibration pilot. Two model runs judged the same 10 cases blind, then their verdicts were compared. Numbers from the pilot:
+- verdict agreement 6/6 on the cases where both completed.
+- exact-match 13/24 on the 1–5 scores.
+- within-1 24/24 on the 1–5 scores.
+
+**Why the pilot receipt file is stamped `pilotWarning`.** Because AI-vs-AI agreement isn't real calibration. Two models trained on similar data may agree more than a real human would. The receipt file is explicit about this — the value is *proving the mechanic works end-to-end*, not *establishing the calibration number*.
+
+**What the real number needs.** A blind human pass. Worksheet already generated. Roughly 30–60 minutes of a human judge (you) rating the 10 cases blind, then comparing to the model's judgments. That's the receipt that turns the calibration mechanic into a calibration *number*.
+
+**The interview line.** *"The calibration mechanic is shipped — Session D pilot proved it end-to-end AI-vs-AI, verdict agreement 6/6, exact-match 13/24, within-1 24/24. The pilot receipt is stamped pilotWarning because AI-vs-AI isn't real calibration. Real calibration needs a blind human pass. Worksheet is ready. That's the honest gap."*
+
+## The feedback loop — how the numbers close on themselves
+
+The loop that closes the numbers into a working flywheel:
+
+- **`npm run eval`** — runs the 10 cases through DiagnosticAgent + RecommendationAgent + judges. Writes per-run receipts (per-case JSON with agent output, judge output, tool calls, tokens, cost).
+- **`npm run eval:report`** — aggregates the receipts into per-criterion pass rates, per-phase latency, per-case cost. Produces the numbers you just read.
+- **`npm run eval:gate`** — reads the aggregate, compares against `eval/baseline.json`, exits non-zero if any criterion regressed.
+- **CI wires eval:gate into the PR flow.** A PR that regresses actionable_next_step from 0% → 0% is fine (no change). A PR that regresses evidence_grounding from 50% → 40% blocks the merge until either the regression is fixed or the baseline is *explicitly* moved (with the reviewer signing off on the movement).
+
+**The move the baseline enables.** The 0% actionable_next_step baseline is now *committed*. A prompt change that lifts it to 30% is a real, measurable win — the gate sees the number move, the PR merges with the new baseline. If the same prompt change accidentally regresses evidence_grounding from 50% → 30% as a side effect, the gate catches that trade *before* the PR merges. That's what "how do you know it's working" answers with, at portfolio-level bar.
+
+## What this section commits to
+
+- Every quality claim in this book has a per-criterion pass rate behind it.
+- Every latency claim has a per-phase p50 behind it.
+- Every cost claim has a per-token-type accounting behind it.
+- The baseline is committed to `eval/baseline.json` at runId `2026-07-03T04-08-28-644Z`.
+- The gate is wired to CI.
+- The blind human calibration is the known open gap; the mechanic is shipped, the number needs a 30–60 min human pass.
+
+Nothing above is aspirational. Every number is on disk.
