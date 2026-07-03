@@ -6,6 +6,12 @@
 // (it replays the committed snapshot directly), so the factory's mode universe
 // is the live Bloomreach adapter plus a local synthetic adapter.
 //
+// Default is `live-synthetic` (fully synthetic — deterministic, no OAuth
+// needed, shows the product working out of the box). `demo` is preserved as
+// a reliability path + regression evidence but no longer in the visible UI
+// toggle; it's still reachable via `?demo=cached` URL param or by manually
+// setting `bi:mode=demo` in localStorage.
+//
 // Lifecycle:
 //   - `'live-bloomreach'`  → defers to `connectMcp(sessionId)`. The Bloomreach
 //                            adapter is session-scoped (OAuth tokens live in
@@ -50,7 +56,10 @@ export type MakeDataSourceResult =
   | { ok: false; mode: 'live-bloomreach'; authUrl: string };
 
 export function parseLiveMode(raw: string | null): LiveMode {
-  return raw === 'live-synthetic' ? 'live-synthetic' : 'live-bloomreach';
+  // Default is `live-synthetic` (fully synthetic — no OAuth needed,
+  // deterministic, shows the product working out of the box). Explicit
+  // `live-bloomreach` still routes to Bloomreach.
+  return raw === 'live-bloomreach' ? 'live-bloomreach' : 'live-synthetic';
 }
 
 /**

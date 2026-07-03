@@ -52,14 +52,17 @@ export default function HomePage() {
   const reconnectPolicy = useReconnectPolicy();
 
   // Demo vs live, toggled at RUNTIME (persisted in localStorage).
-  // Demo serves the cached snapshot — instant + reliable, ideal for a presentation
-  // and the default. live-bloomreach runs the agents against Bloomreach (real
-  // data, but the alpha server may need a reconnect). live-synthetic runs the
-  // same agents/model against deterministic fake data owned by this app.
+  // live-synthetic is the default UX — runs real agents/model against
+  // Blooming-owned deterministic fake data. Shows the product working out of
+  // the box with no OAuth. live-bloomreach runs the agents against real
+  // Bloomreach (needs OAuth reconnect on the alpha server). demo replays the
+  // cached snapshot — still reachable via ?demo=cached URL param or by
+  // manually setting `bi:mode=demo` in localStorage (kept as a reliability
+  // path / dev tool / regression evidence), but no longer in the mode toggle.
   // NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo and hides the toggle. Legacy
   // `'live'` and `'live-sql'` localStorage values migrate to `'live-bloomreach'`.
   const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
-  const [mode, setMode] = useState<BriefingMode>('demo');
+  const [mode, setMode] = useState<BriefingMode>('live-synthetic');
   const [ready, setReady] = useState(false);
   const isDemo = mode === 'demo';
 
@@ -71,13 +74,13 @@ export default function HomePage() {
     } else {
       try {
         const saved = localStorage.getItem('bi:mode');
-        if (saved === 'demo') setMode('demo');
+        if (saved === 'demo') setMode('demo'); // hidden entry point, still respected
         else if (saved === 'live-bloomreach') setMode('live-bloomreach');
         else if (saved === 'live-synthetic') setMode('live-synthetic');
         else if (saved === 'live-sql' || saved === 'live') setMode('live-bloomreach'); // legacy
-        // any other value (or null) → default `'demo'` stays
+        // any other value (or null) → default `'live-synthetic'` stays
       } catch {
-        /* localStorage blocked — default to demo */
+        /* localStorage blocked — default to live-synthetic */
       }
     }
     setReady(true);
@@ -165,11 +168,16 @@ export default function HomePage() {
                 overflow: 'hidden',
               }}
             >
+              {/* demo is deliberately hidden from the visible toggle to keep
+                  the fresh-visitor UX to two clear options. It's still
+                  reachable via `?demo=cached` on any streaming route or by
+                  manually setting `bi:mode=demo` in localStorage — the
+                  branch still fires end-to-end. Preserved as reliability
+                  path, regression evidence, and dev tool. */}
               {(
                 [
-                  { value: 'demo', label: 'demo' },
-                  { value: 'live-bloomreach', label: 'live · bloomreach' },
                   { value: 'live-synthetic', label: 'live · synthetic' },
+                  { value: 'live-bloomreach', label: 'live · bloomreach' },
                 ] as const
               ).map((m) => (
                 <button
