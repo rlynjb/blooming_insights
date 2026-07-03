@@ -53,3 +53,6 @@ next-env.d.ts
 /mcp-server-olist/data/*.db-shm
 /mcp-server-olist/data/*.db-wal
 /mcp-server-olist/data/*.db-journal
+
+# eval receipts — one JSON per run; cost + non-determinism, never committed
+/eval/receipts
