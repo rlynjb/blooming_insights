@@ -85,3 +85,211 @@ stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recomm
 stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 02-fraud-payment-failure-credit-card
 [case 02-fraud-payment-failure-credit-card] done in 181s · diagnosis: fail · recs: [pass_with_notes, pass_with_notes, pass_with_notes]
 
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+
+[case 04-cart-abandonment-mobile-broad] (partial-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T18-11-06-952Z-04-cart-abandonment-mobile-broad","usage":{"input_tokens":335,"cache_creation_input_tokens":1873,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1873,"ephemeral_1h_input_tokens":0},"output_tokens":426,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T18-11-06-952Z-04-cart-abandonment-mobile-broad","usage":{"input_tokens":1371,"cache_creation_input_tokens":0,"cache_read_input_tokens":1873,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":368,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T18-11-06-952Z-04-cart-abandonment-mobile-broad","usage":{"input_tokens":3339,"cache_creation_input_tokens":0,"cache_read_input_tokens":1873,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":200,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T18-11-06-952Z-04-cart-abandonment-mobile-broad","usage":{"input_tokens":3522,"cache_creation_input_tokens":1158,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1158,"ephemeral_1h_input_tokens":0},"output_tokens":1277,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T18-11-06-952Z-04-cart-abandonment-mobile-broad","usage":{"input_tokens":4597,"cache_creation_input_tokens":0,"cache_read_input_tokens":1034,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":810,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T18-11-06-952Z-04-cart-abandonment-mobile-broad","usage":{"input_tokens":335,"cache_creation_input_tokens":3109,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3109,"ephemeral_1h_input_tokens":0},"output_tokens":128,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 05-no-signal-retention-subscribers
+
+[case 05-no-signal-retention-subscribers] (no-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 06-no-signal-price-sensitivity-luxury
+
+[case 06-no-signal-price-sensitivity-luxury] (no-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 07-positive-conversion-surge-mobile
+
+[case 07-positive-conversion-surge-mobile] (positive) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+
+[case 08-checkout-collapse-multi-scope] (has-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 09-engagement-drop-email-campaign
+
+[case 09-engagement-drop-email-campaign] (partial-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+[eval] runId: 2026-07-03T18-11-06-952Z
+[eval] cases:  10
+
+stderr | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ Week 2C · 10 goldens · per-case verdicts                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ case                                          class         diag    recs    ║
+╟──────────────────────────────────────────────────────────────────────────────╢
+║ 01-conversion-drop-mobile-checkout            has-signal    pass_with_notes 2/3     ║
+║ 02-fraud-payment-failure-credit-card          has-signal    fail    3/3     ║
+║ 03-session-drop-organic-mobile                has-signal    judge_error 3/3     ║
+║ 08-checkout-collapse-multi-scope              has-signal    pass_with_notes 1/3     ║
+║ 09-engagement-drop-email-campaign             partial-signal judge_error 1/3     ║
+║ 10-no-signal-seo-organic                      no-signal     judge_error 0/3     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DIAGNOSIS pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility           2/3    ( 67%)   dist [1:0 2:0 3:1 4:1 5:1]
+  evidence_grounding                3/3    (100%)   dist [1:0 2:0 3:0 4:2 5:1]
+  scope_coherence                   2/3    ( 67%)   dist [1:0 2:0 3:1 4:1 5:1]
+  actionable_next_step              0/3    (  0%)   dist [1:0 2:1 3:2 4:0 5:0]
+
+RECOMMENDATION pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  diagnosis_response                4/15   ( 27%)   dist [1:0 2:4 3:7 4:3 5:1]
+  feature_choice_fit                6/15   ( 40%)   dist [1:0 2:4 3:5 4:3 5:3]
+  step_actionability               13/15   ( 87%)   dist [1:0 2:0 3:2 4:11 5:2]
+  impact_realism                    3/15   ( 20%)   dist [1:0 2:2 3:10 4:3 5:0]
+
+Escape-hatch check (≥3 distinct pass/fail patterns per dimension)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility         3 distinct scores  ✓
+  evidence_grounding              2 distinct scores  ✗ substrate too homogeneous
+  scope_coherence                 3 distinct scores  ✓
+  actionable_next_step            2 distinct scores  ✗ substrate too homogeneous
+
+
+ ❯ eval/run.eval.ts (10 tests | 8 failed) 6656751ms
+     × case 01-conversion-drop-mobile-checkout 179212ms
+     × case 02-fraud-payment-failure-credit-card 180528ms
+     × case 04-cart-abandonment-mobile-broad 1123228ms
+     × case 05-no-signal-retention-subscribers 929163ms
+     × case 06-no-signal-price-sensitivity-luxury 991841ms
+     × case 07-positive-conversion-surge-mobile 951111ms
+     × case 08-checkout-collapse-multi-scope 952895ms
+     × case 09-engagement-drop-email-campaign 890083ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 8 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+AssertionError: case 01-conversion-drop-mobile-checkout rec "Build a Persistent SP Mobile Checkout Health Segment and Set Up a Monitoring Experiment": expected 'fail' not to be 'fail' // Object.is equality
+ ❯ eval/run.eval.ts:422:17
+    420|             rj.judgment.verdict,
+    421|             `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"…
+    422|           ).not.toBe('fail');
+       |                 ^
+    423|         }
+    424|       }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/8]⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 02-fraud-payment-failure-credit-card
+AssertionError: expected 'fail' not to be 'fail' // Object.is equality
+ ❯ eval/run.eval.ts:417:55
+    415|         goldenCase.signalClass === 'partial-signal';
+    416|       if (isGated) {
+    417|         expect(receipt.diagnosisJudgment.verdict).not.toBe('fail');
+       |                                                       ^
+    418|         for (const rj of receipt.recommendationJudgments) {
+    419|           expect(
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/8]⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 04-cart-abandonment-mobile-broad
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 05-no-signal-retention-subscribers
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 06-no-signal-price-sensitivity-luxury
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 07-positive-conversion-surge-mobile
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 09-engagement-drop-email-campaign
+Error: Test timed out in 600000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ eval/run.eval.ts:175:44
+    173|   });
+    174|
+    175|   it.each(goldens.map((g) => [g.caseId, g]))(
+       |                                            ^
+    176|     'case %s',
+    177|     async (_label, goldenCase: GoldenCase) => {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/8]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  8 failed | 2 passed (10)
+   Start at  11:11:06
+   Duration  6656.96s (transform 58ms, setup 0ms, import 99ms, tests 6656.75s, environment 0ms)
+
+
+--- eval exit: 1 ---
+
+--- npm run eval:gate (compare vs eval/baseline.json) ---
+
+> app-scaffold@0.1.0 eval:gate
+> RUN_GATE=1 vitest run --config vitest.eval.config.ts eval/gate.eval.ts
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+stderr | eval/gate.eval.ts > phase-5 regression gate · candidate vs baseline > candidate must not regress by more than GATE_MAX_REGRESSION per dim
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ Phase-5 regression gate                                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  Baseline runId:    2026-07-03T04-08-28-644Z (10 cases)
+  Candidate runId:   2026-07-03T18-11-06-952Z (6 cases)
+  Max allowed drop:  0.1 (10 pp)
+
+  Per-dimension pass-rate delta (candidate − baseline)
+──────────────────────────────────────────────────────────────────────────────
+  [diagnosis]
+    root_cause_plausibility         base  75% → cand  67%   Δ -8pp
+    evidence_grounding              base  50% → cand 100%   Δ +50pp
+    scope_coherence                 base  75% → cand  67%   Δ -8pp
+    actionable_next_step            base   0% → cand   0%   Δ +0pp
+  [recommendation]
+    diagnosis_response              base  48% → cand  27%   Δ -21pp ✗ REGRESSED
+    feature_choice_fit              base  62% → cand  40%   Δ -22pp ✗ REGRESSED
+    step_actionability              base 100% → cand  87%   Δ -13pp ✗ REGRESSED
+    impact_realism                  base  43% → cand  20%   Δ -23pp ✗ REGRESSED
+
+  ✗ GATE FAILED — 4 regressed dimension(s)
+
+
+ ❯ eval/gate.eval.ts (2 tests | 1 failed | 1 skipped) 5ms
+     × candidate must not regress by more than GATE_MAX_REGRESSION per dim 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  eval/gate.eval.ts > phase-5 regression gate · candidate vs baseline > candidate must not regress by more than GATE_MAX_REGRESSION per dim
+Error: Regression gate FAILED. 4 dimension(s) regressed by more than 0.1. See /Users/rein/Public/blooming_insights/eval/gate-2026-07-03T18-11-06-952Z.json.
+ ❯ eval/gate.eval.ts:85:13
+     83|
+     84|     if (!gateResult.ok) {
+     85|       throw new Error(
+       |             ^
+     86|         `Regression gate FAILED. ${gateResult.blockingDimensions.lengt…
+     87|       );
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 skipped (2)
+   Start at  13:02:03
+   Duration  89ms (transform 14ms, setup 0ms, import 19ms, tests 5ms, environment 0ms)
+
+
+--- gate exit: 1 ---
+
+=== step 5 eval complete 2026-07-03T13:02:04-07:00 ===

@@ -178,7 +178,24 @@ Option matrix (**revised for the confirmed mechanism: rejected-hypothesis leakag
 
 **Recommended (you decide, but coach's read):** ship **A** — the fingerprint proved the rec agent won't respect `supported: false`, so remove the temptation at the source. It's a 30-minute fix. Reject C on ownership; reject D on cost + it doesn't address the diagnosed mechanism; keep B as a follow-up if you want explicit primaryness for a *different* reason later.
 
-**Shipped (2026-07-03 T17-18 UTC):** Option A landed at `lib/agents/recommendation.ts:33-45` as the exported `filterSupportedHypotheses(diagnosis: Diagnosis): Diagnosis` helper, called from `RecommendationAgent.propose()` before handing to AptKit's internal agent. Five new tests at `test/agents/recommendation.test.ts:298-378` (drops-false / pure-copy / preserves-others / degenerate-all-false / all-supported-unchanged). Full suite: 273/273 pass (was 268). Chose to filter inside `propose()` (not at the route boundary) so every caller — route, direct test, eval, future direct invocation — benefits from the same guarantee.
+**Shipped, then reverted (2026-07-03 T17-18 → T20-08 UTC):** Option A landed as `filterSupportedHypotheses(diagnosis: Diagnosis): Diagnosis` in `lib/agents/recommendation.ts`, called from `RecommendationAgent.propose()`, with 5 new tests. Full suite went 268 → 273. Then the 10-case eval ran (`npm run eval` runId `2026-07-03T18-11-06-952Z`) and **regressed all four recommendation-quality dimensions**. Reverted. Tombstone comment at `lib/agents/recommendation.ts:15-25` documents why the helper is not there.
+
+Case-matched delta (6 cases completed both runs; n=15 rec judgments):
+
+| dim | baseline | candidate | Δ |
+|---|---|---|---|
+| `diagnosis_response` | 50% | 27% | **−23pp** |
+| `feature_choice_fit` | 58% | 40% | **−18pp** |
+| `step_actionability` | 100% | 87% | **−13pp** |
+| `impact_realism` | 42% | 20% | **−22pp** |
+
+Sample size caveat: n=15 rec judgments in the candidate; confidence interval is wide (~±20pp on a single pass rate); can't claim tight causal certainty. But direction is unambiguous across all four dimensions, so the revert is honest even without significance.
+
+**What was wrong with H1's inference.** I predicted the rejected hypotheses were noise the rec agent was mishandling. The eval shows they were **load-bearing context** — "we ruled X out because Y" tells the rec agent both what to avoid AND why the primary is primary. Stripping that context degraded `impact_realism` and `step_actionability` (dims I thought were unrelated to the filter) as well as `diagnosis_response`, which is what an ablation looks like when the removed input actually mattered. My mental model of the handoff was wrong.
+
+**Elevated to next-attempt: Option B (add `primaryHypothesis` field).** Preserves the full `hypothesesConsidered` context AND makes the primary explicit at the type level — no context stripped. Deferred; not shipped in this drill.
+
+**Bonus observability finding (deferred to `.aipe/drills/observability-induce-agent-reasoning-cap-timeout.md`):** cases 04–07 each took 15–19 min (vs ~3 min norm) in the candidate run and blew past `testTimeout=300_000ms`. No receipts written. That's an agent-reasoning cap gap — a case can chew ~19 min of wall clock and API cost before hard-stopping. Separate drill because the mechanism is orthogonal to this coordination failure.
 
 **Design decision to log alongside the fix:** filter-at-handoff sacrifices the "we ruled this out" context that a competent rec agent could theoretically use to avoid overlap with prior thinking. In practice, the fingerprint shows the rec agent isn't using that context correctly anyway — so removing it is the honest read. If a future rec-agent version becomes capable of respecting rejection, this filter is a one-line revert.
 
@@ -187,6 +204,21 @@ Whatever you pick, name what you rejected and *why in one sentence each*. That's
 ---
 
 ## 5. EVAL — the measurement (this is the non-negotiable half)
+
+### Result (2026-07-03) — negative
+
+Ran `npm run eval` with Option A shipped. Runs took a real turn: 6 of 10 cases completed (04–07 timed out, see the observability-cap drill). Case-matched delta vs baseline `2026-07-03T04-08-28-644Z`:
+
+- `diagnosis_response`: 50% → 27% (Δ **−23pp**) — the dimension the fix was supposed to lift went down
+- `feature_choice_fit`: 58% → 40% (Δ −18pp)
+- `step_actionability`: 100% → 87% (Δ −13pp)
+- `impact_realism`: 42% → 20% (Δ −22pp)
+
+Gate output at `eval/gate-2026-07-03T18-11-06-952Z.json`. Full log at `.aipe/drills/fingerprints/step5-eval.log`.
+
+**The number went down across all four dims.** Not up. Reverted (see Step 4 Shipped-then-reverted block).
+
+### Original measurement protocol (kept for reference — this is what to run next time)
 
 **Instrument.** The shipped `eval/rubrics/recommendation-quality.ts` has `diagnosis_response` as one of its 4 dimensions on a 1–5 scale with 3 verdicts. Baseline pass rate: **48%** (`eval/baseline.json`, runId `2026-07-03T04-08-28-644Z`). This is your before-number.
 
@@ -208,9 +240,9 @@ Whatever you pick, name what you rejected and *why in one sentence each*. That's
 
 *(Write this last, once Steps 1–5 have actually been lived. Coach cannot write this for you — it must be in your voice, past-tense, specific, and short.)*
 
-Shape to fill (**post-fingerprint version — leans on the confirmed rejected-hypothesis-leakage mechanism**):
+Shape to fill (**post-eval version — this is a negative-result rep, and the drill spec calls this out as valid L3**):
 
-> "We were shipping recommendations that targeted hypotheses our own diagnosis had already rejected. Our eval harness caught it — `diagnosis_response` was passing at 48% and we didn't know why. I traced it to `_______` (the specific step 2 finding), fixed it by `_______` (probably: filtering `supported: false` entries at the route boundary before handoff), and the pass rate moved to `_______%`. The lesson: a strongly-typed handoff can still lose *negative* signal if the receiver doesn't respect it — sometimes the right fix isn't a better type, it's not sending the data at all."
+> "I traced a 48% pass rate on `diagnosis_response` to what looked like a clean handoff leakage — the rec agent was producing recs targeting hypotheses the diagnosis had marked `supported: false`. A 3-run isolation probe confirmed the leakage disappeared when I filtered rejected entries at the handoff boundary. I shipped that fix — one function, five tests, 30 minutes. Then I ran the eval and the number went DOWN across all four rec dimensions by 13–23pp. Turns out the rejected hypotheses weren't noise — they were load-bearing context. 'We ruled X out because Y' was telling the rec agent both what to avoid AND why the primary was primary. Strip that context and the recs get worse on dimensions I hadn't predicted, like `impact_realism`. Reverted, wrote up the negative result, replanned toward Option B — add explicit primaryness at the type level while preserving the context. The lesson: don't confuse 'the signal I named is real' with 'removing the signal fixes the problem.' The eval was doing exactly what the eval is for — catching my wrong mental model before it shipped."
 
 Anti-patterns to avoid in the war story:
 - "We used a rubric-based LLM-as-judge to evaluate…" — this is jargon, not story. Say *what broke and what it cost*, then how you found it.

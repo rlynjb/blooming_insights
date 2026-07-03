@@ -1,7 +1,7 @@
 // test/agents/recommendation.test.ts
 import { describe, it, expect, vi } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
-import { RecommendationAgent, filterSupportedHypotheses } from '../../lib/agents/recommendation';
+import { RecommendationAgent } from '../../lib/agents/recommendation';
 import type { McpCaller } from '../../lib/agents/base';
 import { AGENT_MODEL } from '../../lib/agents/base';
 import type { WorkspaceSchema } from '../../lib/mcp/schema';
@@ -292,95 +292,5 @@ describe('RecommendationAgent.propose', () => {
 
     const result = await agent.propose(SAMPLE_ANOMALY, SAMPLE_DIAGNOSIS);
     expect(result).toEqual([]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// filterSupportedHypotheses — coordination-failure fix
-//
-// The recommendation agent doesn't respect the `supported: false` flag on
-// individual hypotheses in the handoff; it treats every entry as a concern to
-// address. The 2026-07-03 baseline receipt (case 01 + 08, 6 runs) had 4/6
-// producing a rec[2] targeting the rejected `exp-checkout-copy` hypothesis. A
-// 3-run H1 isolation probe against a single-entry synthetic diagnosis proved
-// the leakage disappears when rejected entries are filtered at the handoff
-// boundary. See:
-//   .aipe/drills/agents-and-tool-use-induce-multi-agent-coordination-failure.md
-// ---------------------------------------------------------------------------
-
-describe('filterSupportedHypotheses', () => {
-  const baseDiagnosis: Omit<Diagnosis, 'hypothesesConsidered'> = {
-    conclusion: 'Payment gateway degradation on mobile checkout in SP.',
-    evidence: ['31.2% spike in credit-card payment failure rate on mobile.'],
-    affectedCustomers: { count: 1180, segmentDescription: 'SP mobile credit-card customers' },
-  };
-
-  it('drops entries with supported: false', () => {
-    const diagnosis: Diagnosis = {
-      ...baseDiagnosis,
-      hypothesesConsidered: [
-        { hypothesis: 'Payment gateway failure', supported: true, reasoning: 'Scope + timing match.' },
-        { hypothesis: 'Running A/B experiment', supported: false, reasoning: 'Excluded — no variant data.' },
-        { hypothesis: 'Broad traffic decline', supported: false, reasoning: 'Other regions flat.' },
-      ],
-    };
-
-    const out = filterSupportedHypotheses(diagnosis);
-    expect(out.hypothesesConsidered).toHaveLength(1);
-    expect(out.hypothesesConsidered[0].hypothesis).toBe('Payment gateway failure');
-    expect(out.hypothesesConsidered.every((h) => h.supported)).toBe(true);
-  });
-
-  it('is a pure copy — does not mutate the input', () => {
-    const diagnosis: Diagnosis = {
-      ...baseDiagnosis,
-      hypothesesConsidered: [
-        { hypothesis: 'A', supported: true, reasoning: '.' },
-        { hypothesis: 'B', supported: false, reasoning: '.' },
-      ],
-    };
-    const snapshot = JSON.parse(JSON.stringify(diagnosis));
-
-    filterSupportedHypotheses(diagnosis);
-    expect(diagnosis).toEqual(snapshot);
-  });
-
-  it('preserves other Diagnosis fields verbatim', () => {
-    const diagnosis: Diagnosis = {
-      ...baseDiagnosis,
-      hypothesesConsidered: [
-        { hypothesis: 'A', supported: true, reasoning: '.' },
-      ],
-    };
-    const out = filterSupportedHypotheses(diagnosis);
-    expect(out.conclusion).toBe(diagnosis.conclusion);
-    expect(out.evidence).toBe(diagnosis.evidence);
-    expect(out.affectedCustomers).toBe(diagnosis.affectedCustomers);
-  });
-
-  it('returns an empty array when every hypothesis was rejected (degenerate case)', () => {
-    // Not expected in practice — a diagnosis that rejected everything is
-    // probably a bug upstream — but the filter shouldn't throw.
-    const diagnosis: Diagnosis = {
-      ...baseDiagnosis,
-      hypothesesConsidered: [
-        { hypothesis: 'A', supported: false, reasoning: '.' },
-        { hypothesis: 'B', supported: false, reasoning: '.' },
-      ],
-    };
-    const out = filterSupportedHypotheses(diagnosis);
-    expect(out.hypothesesConsidered).toEqual([]);
-  });
-
-  it('leaves an all-supported diagnosis unchanged', () => {
-    const diagnosis: Diagnosis = {
-      ...baseDiagnosis,
-      hypothesesConsidered: [
-        { hypothesis: 'A', supported: true, reasoning: '.' },
-        { hypothesis: 'B', supported: true, reasoning: '.' },
-      ],
-    };
-    const out = filterSupportedHypotheses(diagnosis);
-    expect(out.hypothesesConsidered).toHaveLength(2);
   });
 });
