@@ -24,6 +24,10 @@ The confidence map — regions of the codebase annotated by how confidently you 
   │  ★ Portfolio hardening plan (6 phases, all shipped)        │
   │  ★ Prompt caching validated live in logs                   │
   │  ★ CI gate + baseline.json regression floor                │
+  │  ★ In-flight briefing gate (Move 4, cab85c6)               │
+  │    lib/state/in-flight-briefings.ts + 8 tests · 268→276   │
+  │  ★ Move 3 negative-result rep (be05240, 2026-07-03)        │
+  │    tombstone at lib/agents/recommendation.ts:15-25         │
   │                                                            │
   └────────────────────────────────────────────────────────────┘
 
@@ -90,7 +94,7 @@ Say this, as one continuous story:
 >
 > *I found it in a code read. I was working on the session-storage story for `useInvestigation` and read `insights.ts` for a different reason. When I saw `Map<insightId, Insight>` at the module scope, I stopped and asked myself: what happens with two users? The bug crystallized in about ten seconds.*
 >
-> *The fix was a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed. Each session gets its own feed of insights. The test suite passed on the change — now at 261 tests — and I added a concurrent-user test that would have caught the original bug. Shipped.*
+> *The fix was a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed. Each session gets its own feed of insights. The test suite passed on the change — now at 276 tests — and I added a concurrent-user test that would have caught the original bug. Shipped.*
 >
 > *The lesson I keep from that bug is that reviewing AI-generated code with a systems lens is different from reviewing it for correctness. The AI wrote code that was correct for one user. It took a systems question — 'what if there are two users?' — to see the problem. That question isn't in most code review checklists. It has to come from me."*
 
@@ -159,6 +163,26 @@ Say this:
 ┃ "Anyone can build a demo. What I'm proudest of
 ┃  is that this system has receipts you can verify
 ┃  without asking me."
+
+  ### Proudest recent — the Move 3 negative result (2026-07-03)
+
+If the interviewer follows up with "what's the most recent thing you're proud of," this is the answer — and it's a stronger answer because the outcome was a REVERT, not a ship. Say this:
+
+> *"Proudest recent thing shipped is a negative result. Commit `be05240` on 2026-07-03. I induced a multi-agent coordination-failure fingerprint on the recommendation surface — the rec agent was targeting hypotheses the diagnosis had marked `supported: false`. Ran a three-run isolation probe, confirmed the mechanism. Shipped what looked like a targeted fix — one exported helper called `filterSupportedHypotheses`, five new tests. Type-checked, tests green, the isolation probe stopped reproducing the bug.*
+>
+> *Then I ran the 10-case eval. The number went DOWN across ALL FOUR recommendation-quality dimensions by 13 to 23 percentage points. Case-matched, n equals 15.*
+>
+> *Turns out the rejected hypotheses I thought were noise were load-bearing context. The rec agent uses "we ruled X out because Y" both to know what to avoid and to know why the primary is primary. The filter stripped that context, so the recs got shallower.*
+>
+> *I reverted. Wrote up the negative result. Committed the tombstone comment at `lib/agents/recommendation.ts:15-25` — a real code-level "here's what I tried and why it didn't work" — so the next reader (or the next me) doesn't have to re-derive the lesson.*
+>
+> *I'm proud of it because it's exactly the discipline the eval harness was built for. Being wrong fast. Catching it before it shipped to a user. Owning the misread publicly with a tombstone rather than a quiet revert. That's the flywheel earning its keep in a single move."*
+
+┃ "Proudest recent thing shipped is a REVERT.
+┃  The eval harness caught what my type system,
+┃  my tests, and my isolation probe all said was
+┃  a clean fix. That's the flywheel earning its
+┃  keep in a single move."
 
   ## The least confident — the actionable_next_step 0% baseline
 
@@ -351,12 +375,13 @@ The proudest part — the portfolio hardening plan — you'd sequence identicall
 
   ## The one-page summary
 
-**Core claim.** Three hard parts, three honest positions. The hardest bug: AI wrote a `Map<id, Insight>` that silently corrupted feeds for two users; you caught it in a code read; you fixed it with session-keying. The proudest part: the six-phase portfolio hardening plan shipped end-to-end, every claim receipt-backed. The least confident: `actionable_next_step` 0% pass rate — you have the receipt, you know the fix shape, the regression gate protects the fix, but the fix isn't shipped.
+**Core claim.** Three hard parts, three honest positions. The hardest bug: AI wrote a `Map<id, Insight>` that silently corrupted feeds for two users; you caught it in a code read; you fixed it with session-keying. The proudest part: the six-phase portfolio hardening plan shipped end-to-end, every claim receipt-backed — and the proudest recent thing is the Move 3 negative result (2026-07-03, `be05240`), where the eval caught what tests and type system did not. The least confident: `actionable_next_step` 0% pass rate — you have the receipt, you know the fix shape, the regression gate protects the fix, but the fix isn't shipped.
 
 **The questions covered.**
 
   → "What was the hardest bug?" → concurrent-user wipe in insights.ts. AI wrote it, you owned finding it and fixing it.
   → "What are you proudest of?" → six-phase hardening plan, all shipped, all receipt-backed.
+  → "What are you proudest of RECENTLY?" → Move 3 (be05240, 2026-07-03) — the negative-result rep. Induced coordination-failure fingerprint, isolated mechanism, shipped a targeted fix, ran the 10-case eval, watched it regress 13–23pp across four recommendation dimensions, reverted, wrote up the negative result, committed the tombstone at lib/agents/recommendation.ts:15-25.
   → "What's least confident?" → actionable_next_step 0% baseline. Systemic prompt gap named, fix shape named, gate protects, not yet shipped.
   → "Have you audited for the same class of bug?" → Partial audit, honest gap named.
 

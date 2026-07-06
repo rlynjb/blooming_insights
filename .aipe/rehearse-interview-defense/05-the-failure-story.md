@@ -49,6 +49,12 @@ The failure-mode map. Each surface is a box. Each box names what the system does
   │    → decodeConfigHeader returns null (fail-safe, no throw)  │
   │    → route falls through to env defaults                    │
   │    → isMcpConfigOverride validates shape server-side        │
+  │                                                             │
+  │  Concurrent same-session /api/briefing (two tabs)           │
+  │    → tryAcquireBriefing(sessionId) — in-flight gate         │
+  │    → second request: 409 + Retry-Hint, no pipeline run      │
+  │    → winner releases in finally                             │
+  │    → RECEIPT: 8 new tests · suite 268 → 276                 │
   └────────────────────────┬────────────────────────────────────┘
                            │
   ┌─ Agent layer faults ───▼────────────────────────────────────┐
@@ -238,6 +244,20 @@ You'll cover the fix in depth in Chapter 6, but it belongs on the failure map he
 
 Volunteering a real past failure — one that's fixed and receipted — is a stronger signal than defending only the successes.
 
+  ### Concurrent-briefing race — caught and fixed
+
+The second one in this class — the same failure at a different surface. Volunteer it.
+
+> *"Silent data loss when a user opens two tabs and both trigger briefings — the second one's `putInsights` wipes the first's writes. Four study audits converged on the finding; I read the code and reframed the bug — it wasn't a shared-map race, it was a request-coordination gap. The map at `lib/state/insights.ts` was already correctly session-keyed. What wasn't guarded was two overlapping `/api/briefing` requests on the same session, each doing 30 to 90 seconds of async MCP + agent work, then both calling `putInsights` at the end.*
+>
+> *I shipped a `Map<sessionId, AbortController>` gate at the route boundary — `lib/state/in-flight-briefings.ts`. The first request in acquires; concurrent requests get a 409 with a retry hint. Winner releases in a `finally` block. 8 new tests. Suite went from 268 to 276.*
+>
+> *That's the pattern — same silent-data-loss class as the original `insights.ts` bug, different surface. Both caught by reading the code, not by a test. Both fixed with the smallest coordinator that closes the class of race. This one's the receipt that I don't only find these bugs, I also pick the right surface to fix them on."*
+
+┃ "Same class as the original insights.ts wipe.
+┃  Different surface. Both caught by reading the
+┃  code, not by a test. 8 tests, suite 268 → 276."
+
   ## The follow-up decision tree
 
 Failure questions have a distinct branching pattern. Here's what interviewers push on:
@@ -362,6 +382,7 @@ The rest of the failure story stays. Composed timeouts, model-reasons-around-fau
   → "What if MCP hangs?" → 30s per-call timeout at transport.ts:38+131, composed with 300s route budget.
   → "What if the OAuth token revokes?" → capturing fetch surfaces invalid_token, client resets auth, guarded one-reload.
   → "What stops a visitor from pointing MCP at a malicious server?" → isMcpConfigOverride server-side guard, fail-safe decodeConfigHeader (null on malformed, not throw), UI warns "only enter URLs you trust." Honest gap: no SSRF-style allow-list yet.
+  → "What about two tabs briefing at once?" → tryAcquireBriefing gate at lib/state/in-flight-briefings.ts, 409 + retry-hint on concurrent same-session. 8 new tests, suite 268 → 276.
   → "What's your retry strategy?" → McpClient exponential backoff with jitter, no cache-on-error, gives up on budget.
   → "Any circuit breakers?" → not formally. Would add one to McpClient if I were doing it again.
 

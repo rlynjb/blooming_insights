@@ -304,8 +304,9 @@ The AI question has a distinct branching shape. Interviewers pick different foll
   │      coordination failure last week and
   │      shipped what looked like a clean fix, my
   │      isolation probe said it worked, my type
-  │      system said it worked, my 268 unit tests
-  │      passed. The eval regressed the number by
+  │      system said it worked, my unit tests all
+  │      passed (the suite is at 276 today). The
+  │      eval regressed the number by
   │      20+pp on four dimensions and I reverted.
   │      The eval is the last line where being
   │      wrong is cheap.

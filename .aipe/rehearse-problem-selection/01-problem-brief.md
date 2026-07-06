@@ -96,3 +96,12 @@ The constraints that show up in the code, not the ones on the whiteboard:
 Name it directly for the interviewer's mental model: this is an **AI product problem, not an AI research problem**. You're not proving a novel technique. You're taking a well-understood pattern — LLM + tool use + streaming — and applying it to a workflow that currently doesn't have an AI-native version, in a way that respects the reality of the underlying data platform (any MCP server, with Bloomreach alpha as the default preset), the model (Claude Sonnet 4.6), and the interface (web browser, streamed sidebar).
 
 The interviewer bar for AI product work is *judgment*, not *invention*. This book is the receipts on judgment.
+
+## Lived drilling since the last pass — two receipts
+
+Two failure reps landed after the hardening plan closed, both dated 2026-07-03, both defensible as "picked the right problem AND kept probing it responsibly":
+
+- **Move 3 (`be05240`) — coordination-failure drill on the multi-agent handoff.** Baseline showed 4/6 runs targeting a `supported: false` hypothesis. Isolated the fingerprint with a 3-run probe. Shipped `filterSupportedHypotheses` at the handoff boundary. **The full 10-case eval regressed all 4 recommendation dimensions by 13–23pp. Reverted.** Tombstone comment sits at `lib/agents/recommendation.ts:15-25`. This is a rare, defensible signal — a negative-result rep with the eval as the safety net that caught what the mental model missed.
+- **Move 4 (`cab85c6`) — L1 correctness drill on the concurrent same-session `/api/briefing` race.** Fresh study guides (runtime, database, system, distributed) converged on the finding. Initially framed as "session-key the map" — reading the code showed the map was already session-keyed. **Real bug: concurrent same-session `putInsights` last-writer-wins.** Shipped Option A: a route-level in-flight gate via a new `lib/state/in-flight-briefings.ts` module + 8 tests, NOT `insights.ts`. Test count moved 268 → 276.
+
+Both moves are what "problem selection is a discipline, not a one-time pick" looks like when the discipline is on. The eval catching Move 3 is the receipt that the flywheel isn't ornamental — it's the thing that told me my hypothesis was wrong before it shipped.

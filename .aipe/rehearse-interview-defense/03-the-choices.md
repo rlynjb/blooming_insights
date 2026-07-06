@@ -33,6 +33,9 @@ Here's the decision tree for the six choices, with the picked option highlighted
   │  Mode: DELIBERATE                                       │
   │  → 5th use: swappable MCP server (Bloomreach as         │
   │    default PRESET, not codebase identity)               │
+  │  → 3c follow-up: in-flight briefing gate                │
+  │    (route-level 409, chosen over state-level append-    │
+  │     only after reading the code, not the audits)        │
   └───────────────────────────┬─────────────────────────────┘
                               │
   ┌─ 4. Streaming transport ─▼──────────────────────────────┐
@@ -199,6 +202,73 @@ Say this:
 ┃  codebase identity. Same DataSource port, now
 ┃  in five uses without a caller-surface change —
 ┃  that's the abstraction-pressure receipt."
+
+  ## Choice 3c — The in-flight briefing gate (concurrent-briefing race)
+
+This is the newest load-bearing choice in the codebase. It's specifically valuable in an interview because the L5 story is not "I fixed a race" — it's "I read the code before I trusted the audits, and reframed the bug."
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "How do you handle two concurrent briefing    │
+│   requests from the same session?"              │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you know the failure surface at the route   │
+│   boundary vs. the state boundary? Can you       │
+│   pick the right surface to fix on?             │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"Four fresh study audits converged on `lib/state/insights.ts` as having a race. I initially framed it as 'session-key the map.' Reading the code showed the map was already correctly session-keyed — cross-user bleed wasn't the actual failure. The real bug was two concurrent same-session `/api/briefing` requests — a user with two tabs open — both reaching `putInsights` after independent 30-to-90-second pipelines. Second call's `s.insights.clear()` wipes the first call's writes. Silent data loss.*
+>
+> *I could have fixed it at three surfaces. State-level: make `putInsights` append-only with a `briefingId` field on every insight. Route-level: an in-flight gate that rejects concurrent same-session requests with a 409. Client-level: disable the briefing button while a request is in flight.*
+>
+> *I shipped the route-level gate. `lib/state/in-flight-briefings.ts` — a `Map<sessionId, AbortController>`. Around 30 lines of core code plus 8 new tests. The route calls `tryAcquireBriefing(sessionId)`; if a request already holds the gate, the route returns 409 with a retry hint rather than proceeding. Winner releases in a `finally` block.*
+>
+> *I rejected the state-level option because append-only insights is a semantic upgrade that doesn't earn its cost until multi-briefing history is a product feature — which it isn't. I kept it in pocket for the day it becomes one. I rejected the client-level option because a button-disable is a UX hint, not a fix — it's bypassable via curl or dev tools.*
+>
+> *The receipt is that I read the code, not just the audits, before picking the surface. The audits said 'race in insights.ts.' The code said 'the state is fine; the coordination gap is at the route.' That reframe is the load-bearing move."*
+
+┃ "The audits said 'race in insights.ts.' The code
+┃  said 'the coordination gap is at the route.'
+┃  That reframe is the L5 move — not the fix itself."
+
+```
+  Option matrix — where to fix the concurrent-briefing race
+
+  OPTION                       │ COST                    │ VERDICT
+  ─────────────────────────── │ ──────────────────────── │ ────────
+                              │                          │
+  A — Route in-flight gate     │ ~30 LOC + 8 tests       │ ★ SHIPPED
+    Map<sessionId,             │ Server-side, small,     │
+    AbortController>,          │ preserves "each          │
+    409 on concurrent          │ briefing is              │
+                              │ authoritative"           │
+                              │ semantic                 │
+                              │                          │
+  B — Append-only insights     │ ~40 LOC + schema churn  │ pocket
+    with briefingId field      │ + reader rework;         │ (defer
+                              │ semantic upgrade         │ until
+                              │ without a product        │ multi-
+                              │ feature to earn it       │ briefing
+                              │                          │ history)
+                              │                          │
+  C — Client button-disable    │ small; bypassable via   │ reject
+                              │ curl / dev tools; UX     │
+                              │ hint, not a fix          │
+                              │                          │
+  D — Per-session mutex        │ full concurrency        │ reject
+                              │ primitive; over-         │ (over-
+                              │ engineered for "user     │ engineered)
+                              │ opened two tabs"         │
+                              │                          │
+  E — A + B                    │ costs of both;           │ future
+                              │ redundant until B        │
+                              │ has a product reason     │
+```
+
+The move: name the surface options explicitly (A/B/C/D/E), name the axis (semantic cost vs. product-feature-earned), name the verdict, and name why the receipt is the code-read reframe, not the code itself.
 
   ## Choice 4 — NDJSON over SSE
 
@@ -367,7 +437,7 @@ The other five choices you'd make the same way. Framework, AptKit, DataSource, N
 
   ## The one-page summary
 
-**Core claim.** Six load-bearing choices, plus the swappable-MCP follow-up embedded in Choice 3. Each defended with the alternative considered, the axis picked on, and the cost paid. The six: Next.js 16 (streaming primitive), AptKit (own the boundary, library owns the loop), DataSource port (5 uses / 0 caller changes; Bloomreach as default preset, not identity), NDJSON (POST support + framing control), deterministic supervisor (predictable cost, straight-line trace), portfolio hardening plan (six phases, all shipped, COMPLETE).
+**Core claim.** Six load-bearing choices, plus the swappable-MCP follow-up (3b) and the in-flight briefing gate (3c) embedded in Choice 3. Each defended with the alternative considered, the axis picked on, and the cost paid. The six: Next.js 16 (streaming primitive), AptKit (own the boundary, library owns the loop), DataSource port (5 uses / 0 caller changes; Bloomreach as default preset, not identity; route-level in-flight gate as the 3c fix on top of it), NDJSON (POST support + framing control), deterministic supervisor (predictable cost, straight-line trace), portfolio hardening plan (six phases, all shipped, COMPLETE).
 
 **The pull quotes.**
 

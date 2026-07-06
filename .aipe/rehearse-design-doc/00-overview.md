@@ -1,6 +1,6 @@
 # RFC book — blooming insights
 
-Ten design decisions, each written the way it should have been written the first time. Not a tour of the codebase — a **defense** of the choices load-bearing enough that a skeptical reviewer will ask "why this way?"
+Eleven design decisions, each written the way it should have been written the first time. Not a tour of the codebase — a **defense** of the choices load-bearing enough that a skeptical reviewer will ask "why this way?"
 
 The reviewer is a staff engineer who's seen more streaming stacks than you have. Your job is to lead with the decision, name the alternatives you actually considered, and own the tradeoffs without flinching. Every RFC in this book is about a decision already in the code — you're not proposing, you're documenting under scrutiny.
 
@@ -19,6 +19,7 @@ The whole system — where each RFC lives
   ┌─ Route layer (app/api) ───▼──────────────────────────────────────┐
   │  /api/briefing · /api/agent — NDJSON producers                    │
   │  encoder ↔ readNdjson (RFC-02) · deterministic supervisor (RFC-03)│
+  │  in-flight briefing gate on /api/briefing (RFC-11)                │
   └───────────────────────────┬──────────────────────────────────────┘
                               │
   ┌─ Agent layer (lib/agents) ▼──────────────────────────────────────┐
@@ -38,6 +39,7 @@ The whole system — where each RFC lives
                               │
   ┌─ Session state (in-process) ▼────────────────────────────────────┐
   │  lib/state/insights.ts · session-keyed maps · no DB (RFC-01)      │
+  │  lib/state/in-flight-briefings.ts · per-session gate (RFC-11)     │
   └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -45,18 +47,18 @@ Each RFC below points at one box (or one seam between two).
 
 ---
 
-## The ten RFCs, ranked by reconsiderability
+## The eleven RFCs, ranked by reconsiderability
 
-The order is deliberate: the first three are foundational and reasonably safe; the middle four are where a reviewer will push hardest; the last three are the recent hardening layer, so they're the freshest and the ones most likely to change again in the next quarter.
+The order is deliberate: the first three are foundational and reasonably safe; the middle four are where a reviewer will push hardest; the last four are the recent hardening layer, so they're the freshest and the ones most likely to change again in the next quarter.
 
 ```
 Reconsiderability — how likely you'd flip this call in the next quarter
 
-  most stable                                                 most in-flux
-  ─────────────────────────────────────────────────────────────►
+  most stable                                                       most in-flux
+  ───────────────────────────────────────────────────────────────────►
 
-  RFC-04  RFC-02  RFC-06  RFC-05  RFC-03  RFC-01  RFC-10  RFC-09  RFC-07  RFC-08
-  (framework) (kernel)     (adapter)     (supervisor)      (gate) (cache) (budget) (faults)
+  RFC-04  RFC-02  RFC-06  RFC-05  RFC-03  RFC-01  RFC-10  RFC-09  RFC-11  RFC-07  RFC-08
+  (framework) (kernel)     (adapter)     (supervisor)      (gate) (cache) (in-flight) (budget) (faults)
 ```
 
 | # | Decision | Load-bearing consequence |
@@ -71,6 +73,7 @@ Reconsiderability — how likely you'd flip this call in the next quarter
 | 08 | Fault-injection DataSource decorator | 9 injected faults / 3 investigations / 0 failures — receipt for graceful degradation |
 | 09 | Prompt caching on system prompt | validated live: `cache_creation_input_tokens 3168 → cache_read_input_tokens 3168` |
 | 10 | Regression gate (baseline vs candidate) | `eval/gate.eval.ts` blocks any dimension regressed by >10pp — CI-ready |
+| 11 | In-flight briefing gate (per-session request coordination) | `lib/state/in-flight-briefings.ts` (~85 LOC) · route-level `Map<sessionId, AbortController>` · 409 on concurrent same-session briefings — closes the silent putInsights race |
 
 The most reconsiderable one — the RFC a reviewer is most likely to push you to flip — is **RFC-08 (fault-injection decorator)**. See its Open Questions.
 

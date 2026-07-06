@@ -55,7 +55,7 @@ None of those are goals. The DB would carry weight it doesn't need to carry.
 
 **What re-adding it would cost.** ORM choice, migration file discipline, connection pooling in a serverless env (Vercel), auth-per-user (currently the OAuth is per-machine, per-session), a whole new class of bugs (leaked connections, migration drift), and — most damning — it would make the `live-synthetic` / `demo` mode gradient harder, because the committed `demo` snapshot would have to sync to the DB rather than being read as plain JSON.
 
-**The receipt.** Committed demo snapshots at `lib/state/demo-insights.json`, `lib/state/demo-investigations.json`. Zero DB code in the repo. The 261-test suite runs without any DB fixture.
+**The receipt.** Committed demo snapshots at `lib/state/demo-insights.json`, `lib/state/demo-investigations.json`. Zero DB code in the repo. The 276-test suite runs without any DB fixture.
 
 ### No LLM supervisor — deterministic route code
 

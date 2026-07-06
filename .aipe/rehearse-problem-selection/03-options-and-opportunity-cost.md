@@ -105,6 +105,8 @@ Five shipped uses, no agent code changed. That's the port/adapter pattern earnin
 
 **The receipt-density on use #5, specifically.** The swappable-MCP work was itself a real choice — hardcoding Bloomreach forever would have been faster in the moment, and defensible up until the day an interviewer asks "can this hit my company's MCP server?" The un-hardcoded version cost roughly one day of work (Sessions A–D), preserved backward compatibility (the default preset is still Bloomreach with the existing PKCE + DCR flow untouched), and shipped three concrete providers behind one interface. The fact that ~1 day of work covered that surface — with the existing agents, existing tools, existing eval unchanged — is the receipt for the abstraction *quality*. A rougher seam would have cost a week to generalize; this one cost a day, because the port was already load-bearing everywhere it needed to be.
 
+**Second-order receipt — the seam held under a real bug (Move 4, `cab85c6`, 2026-07-03).** The concurrent same-session `/api/briefing` drill converged on a last-writer-wins race in `putInsights`. Initial framing said "session-key the map" — reading the code showed the map was already session-keyed. Actual fix: a route-level in-flight gate via a new `lib/state/in-flight-briefings.ts` module (plus 8 tests). **The state module `insights.ts` was not touched.** That's the abstraction paying off a second time — the fix landed at the boundary the boundary was for, without disturbing the storage layer it wrapped. Test count moved 268 → 276.
+
 **The interview line.** *"The DataSource seam looked speculative until it earned 5 uses without changing caller code: Olist add, Olist remove, Synthetic add, Fault-injecting decorator, and the McpDataSource + AuthProvider generalization that made the whole app swappable-MCP from a UI modal. That last one is the receipt I'd stake it on — an abstraction that survives a category of change it wasn't originally scoped for (auth, not just data) is the abstraction you keep."*
 
 ## Option 3 — NDJSON over fetch stream
@@ -188,6 +190,8 @@ Each phase's output was the next phase's input. Phase 1 without Phase 2 has no w
 **Per-session commit hygiene.** Small commits with receipts in the commit messages. Not "wip" and not "cleanup." Each commit stands as an audit trail of what was tried, what worked, what was reverted.
 
 **The interview line.** *"The hardening plan wasn't 'do these things eventually.' It was 6 phases ordered by dependency — each phase's output was the next phase's input. Phase 1 (eval) was the foundation because it gave me a baseline to measure everything else against."*
+
+**The negative-result receipt on the flywheel (Move 3, `be05240`, 2026-07-03).** The clearest evidence that the sequencing wasn't ornamental is a drill where the eval *caught the mistake*. The multi-agent handoff drill isolated a fingerprint (4/6 baseline runs targeting a `supported: false` hypothesis) and shipped `filterSupportedHypotheses` at the handoff boundary. The full 10-case eval regressed all 4 recommendation dimensions by 13–23pp. Reverted. Tombstone at `lib/agents/recommendation.ts:15-25`. The mental-model fix was wrong; the gate was the safety net. That's the flywheel doing its job — not the flywheel getting shown off.
 
 ## The pattern — how to defend option choices in general
 

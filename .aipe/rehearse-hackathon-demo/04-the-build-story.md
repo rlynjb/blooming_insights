@@ -136,6 +136,35 @@ You do not tour every phase. You name the arc, spotlight one, and get out. The r
 
   If you have to cut the hard-part line for time, drop it — but keep the "shipped, measured, demoable" line above. That one is the closer for this chapter.
 
+  ## The post-hardening quality discipline — two lived drills
+
+  Phase 5 shipped. What proves the shipped state is durable is what happened *after* the hardening pass closed — two lived failure-reps against the codebase, both dated 2026-07-03. This is the sentence you keep in your back pocket for Q&A: **the eval you just watched catches real regressions on stage-adjacent work.** You do not deliver this from the podium in the 45-second slot. You deliver it when a judge probes the eval or asks about race conditions.
+
+```
+  Two drills, one week — post-hardening discipline
+
+  ┌── Move 3 · commit be05240 ─────┐
+  │ coordination-failure drill on   │  shipped filterSupportedHypotheses;
+  │ multi-agent handoff             │  ran full 10-case eval; regressed
+  │                                 │  4 recommendation dims by 13–23pp;
+  │  NEGATIVE-RESULT REP            │  reverted. the eval was the safety
+  │  (the eval caught it)           │  net. this is the receipt that
+  │                                 │  proves the gate is load-bearing.
+  └────────────────────────────────┘
+
+  ┌── Move 4 · commit cab85c6 ─────┐
+  │ in-flight briefing gate         │  4 study audits converged on the
+  │                                 │  finding; read the code; reframed
+  │  lib/state/in-flight-           │  the bug (concurrent-briefing race,
+  │  briefings.ts + 8 tests         │  not shared-state Map race);
+  │                                 │  shipped route-level gate.
+  └────────────────────────────────┘
+
+  Recon audit at .aipe/audits/recon-2026-07-03.md places the repo at L2.
+```
+
+  The frame for Q&A: **Phase 5 was the hardening pass; the drills are the receipts that the hardening holds.** Move 3 is the strongest of the two for a hackathon audience because it demonstrates the eval catching a real regression on work adjacent to what they just saw on stage — the negative-result rep is unusually credible.
+
   ## Strong vs weak — the build story failure mode
 
   The failure mode here is tour-guiding the whole arc. In 45 seconds you cannot walk five phases. You can name them and spotlight one.
@@ -227,6 +256,12 @@ You do not tour every phase. You name the arc, spotlight one, and get out. The r
   │                                                           │
   │  The one line to nail:                                    │
   │    → "shipped, measured, and demoable in one command."    │
+  │                                                           │
+  │  Back-pocket (for Q&A, not the 45s):                      │
+  │    → Move 3 (be05240): negative-result rep — eval         │
+  │       caught 4 rec dims regressed 13–23pp; reverted       │
+  │    → Move 4 (cab85c6): in-flight briefing gate            │
+  │       (lib/state/in-flight-briefings.ts + 8 tests)        │
   │                                                           │
   │  IF IT BREAKS:                                            │
   │    → slide fails → verbal SAY track only                  │

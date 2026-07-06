@@ -55,7 +55,7 @@ Each file answers one review-room question. Walk them in order — later files a
 - **`02-scope-cuts-and-non-goals.md`** — what you cut and why. The cuts you *reconsidered and un-cut* are the L5 signal — showing the eval work, cost controls, and fault tolerance shipped end-to-end after being deferred.
 - **`03-options-and-opportunity-cost.md`** — the paths not taken. Own loop → aptkit migration. DataSource seam pattern (5 uses shipped, including the auth-provider generalization that made MCP swappable). NDJSON over fetch stream. Portfolio hardening sequencing. Each with the opportunity cost named.
 - **`04-success-metrics-and-feedback-loop.md`** — real measured numbers from baseline `2026-07-03T04-08-28-644Z`. Per-phase latency, per-case cost, per-criterion pass rates. The regression gate that closes the loop.
-- **`05-skeptical-reviewer-questions.md`** — the six probes you'll actually get, each with the answer that holds under follow-up.
+- **`05-skeptical-reviewer-questions.md`** — the nine probes you'll actually get, each with the answer that holds under follow-up. Includes the eval-for-show probe (answered with the Move 3 negative-result rep) and the "isn't the in-flight gate overkill?" probe (answered with the Move 4 option matrix).
 
 ## The strongest defense in one line
 

@@ -1,6 +1,6 @@
 # Skeptical reviewer questions
 
-**The memorize-this file.** Seven probes you *will* get in a senior loop, each with the answer that holds under follow-up. Coach voice — this is what you say in the room, not what you think.
+**The memorize-this file.** Nine probes you *will* get in a senior loop, each with the answer that holds under follow-up. Coach voice — this is what you say in the room, not what you think.
 
 For each probe: the question as they'll actually ask it, the answer in the shape you should deliver it (verdict first, then the receipt), and one follow-up you should preempt so they don't get to it first.
 
@@ -100,7 +100,37 @@ This one's about whether you'll optimize without evidence. The obvious move is t
 
 **The follow-up you preempt.** *"The intent classifier is already on Haiku 4.5 — see `lib/agents/intent.ts`. So it's not a Haiku-avoidance thing; it's a measure-before-you-route thing."*
 
-## The pattern across all seven
+## Probe 8 — "How do I know your evals aren't just for show?"
+
+This one comes from the interviewer who's seen too many portfolio evals that regress-to-vibes the moment a real change lands. The wrong move is to defend the eval abstractly. The right move is a lived receipt where the eval *caught you being wrong*.
+
+**The answer.**
+
+*"Move 3 — commit `be05240`, dated 2026-07-03. Coordination-failure drill on the multi-agent handoff. Baseline showed 4/6 runs targeting a `supported: false` hypothesis. I isolated the fingerprint with a 3-run probe, shipped `filterSupportedHypotheses` at the handoff boundary, and ran the full 10-case eval. The eval regressed all 4 recommendation dimensions by 13–23pp. I reverted. Tombstone comment lives at `lib/agents/recommendation.ts:15-25`."*
+
+*"That's the receipt. The eval caught what my mental model got wrong. If the eval were for show, I'd have shipped the change and moved on. Because the gate is real, I couldn't — and I didn't."*
+
+**The move.** You gave them a commit hash, a date, a magnitude (13–23pp), and a file path — inside 30 seconds. You reframed "not for show" from an assertion into a lived rep. Negative-result receipts are rare; leading with one is the credibility play.
+
+**The follow-up you preempt.** *"And that's not the only drill. Move 4 the same day fixed a real concurrent-request race — the eval passed on that one, so it shipped. The flywheel isn't calibrated to always block; it's calibrated to block when the numbers say block."*
+
+## Probe 9 — "Isn't a new module + eight tests overkill for a race condition?"
+
+This is the interviewer probing whether you shipped scope you didn't need on the concurrency fix. The Move 4 patch introduced `lib/state/in-flight-briefings.ts` — a new module with an in-flight Map, plus 8 tests. The lazy move is to argue "well, correctness matters." The right move is to name what the alternative would have cost and show the sizing came from the option matrix, not from over-engineering.
+
+**The answer.**
+
+*"The bug was concurrent same-session `putInsights` last-writer-wins on `/api/briefing`. The initial framing was 'session-key the map' — reading the code showed the map was already session-keyed. So the real fix had to live at a different layer."*
+
+*"Option matrix at the drill scaffold showed three shapes: a route-level in-flight gate (Option A), a state-module lock inside `insights.ts` (Option B), or a queue (Option C). Option B would have coupled concurrency to the storage module, which is exactly the concern the seam pattern exists to avoid. Option C was scope for a workload that isn't multi-tenant. Option A — a small in-flight Map keyed by session, gated at the route layer — was the minimally sufficient shape."*
+
+*"~40 LOC of module code + 8 tests to cover concurrent request de-dup, session isolation, and the release-on-completion path. Test count moved 268 → 276. That's the smallest fix that actually addresses the race without pulling in load the workload doesn't carry. Overkill would have been Option C."*
+
+**The move.** You (a) named why the obvious fix wasn't the fix, (b) walked the option matrix so the sizing looks like an evaluated pick, (c) named the specific alternative that *would* have been overkill (Option C), and (d) gave the concrete numbers (40 LOC, 8 tests, 268 → 276). The choice looks disciplined, not zealous.
+
+**The follow-up you preempt.** *"And critically, `insights.ts` was not touched — the fix landed at the route boundary the seam pattern is for. That's the abstraction quality receipt: the seam absorbed a real bug pressure without leaking into the storage layer."*
+
+## The pattern across all nine
 
 Notice what every answer does:
 

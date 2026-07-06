@@ -4,14 +4,14 @@ The buzzer went off. The room is polite-clapping. A judge raises a hand. This is
 
 The Q&A rules are different from the demo. In the demo you were choreographing a room; here you're one-on-one with a judge who has one probe and about 45 seconds of patience. The answers are short. They point at receipts. They own the rough edges. They never hedge.
 
-Nine probes come up almost every time. You rehearse the verbatim answer to each. When a variant of a probe lands, you recognize the shape and use the answer. If a probe is genuinely off-script, you have a fallback move: "the honest answer is I don't know — here's what I'd need to find out." That answer beats a fabricated one, always.
+Eleven probes come up almost every time. You rehearse the verbatim answer to each. When a variant of a probe lands, you recognize the shape and use the answer. If a probe is genuinely off-script, you have a fallback move: "the honest answer is I don't know — here's what I'd need to find out." That answer beats a fabricated one, always.
 
-  ## The Q&A shape — nine anticipated probes
+  ## The Q&A shape — eleven anticipated probes
 
   Each probe has a category. Recognizing the category is 80% of answering well.
 
 ```
-  The nine probes — what judges ask after a hackathon demo
+  The eleven probes — what judges ask after a hackathon demo
 
   ┌── probe ──────────────────────┬── category ─────────────────┐
   │ 1. isn't synthetic just fake?  │ credibility of the demo     │
@@ -37,6 +37,13 @@ Nine probes come up almost every time. You rehearse the verbatim answer to each.
   ├────────────────────────────────┼─────────────────────────────┤
   │ 9. is the eval harness         │ receipts realness           │
   │    actually real?              │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 10. you mention evals — did    │ eval as safety net          │
+  │     they ever catch something? │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 11. how do you handle race     │ concurrency / serverless    │
+  │     conditions in a serverless │                             │
+  │     setup?                     │                             │
   └────────────────────────────────┴─────────────────────────────┘
 ```
 
@@ -250,6 +257,57 @@ Nine probes come up almost every time. You rehearse the verbatim answer to each.
      receipt from the latest committed run."
 ```
 
+  ## Probe 10 — "you mention evals — did they ever catch something?"
+
+  This is the eval-as-safety-net probe. A judge is checking whether the eval is decorative or whether it has ever bitten. The answer is a lived negative-result rep, dated, with a commit hash. Deliver it plainly — the receipt does the work.
+
+  ┃ "Yes. Commit be05240, two days ago. I shipped a coordination pass called filterSupportedHypotheses on the multi-agent handoff. Ran the full 10-case eval. Four recommendation dimensions regressed by 13 to 23 points. Reverted the change. The eval was the safety net — that's the receipt that proves the gate is load-bearing on real work, not just theoretical."
+
+  The move: **name the commit, name the number, name the outcome**. The judge is asking whether you have ever been saved by the tooling you built. The answer is yes, and it's the strongest single receipt in the whole book because it's a *negative* result — a failure you ate on purpose because the eval caught it.
+
+  Follow-up decision tree:
+
+```
+  If judge asks "why did you ship it if you weren't sure?" →
+    "That's what the eval is for. Four study audits pointed at
+     coordination failure as a risk. filterSupportedHypotheses was
+     the drill for it. You ship the drill, you run the eval, you
+     find out. Reverting on a 13–23pp regression across four dims is
+     the shipped state of the discipline, not a mistake in it."
+
+  If judge asks "would you have caught it in code review?" →
+    "No — the regression was in recommendation quality across four
+     dimensions, not in a testable invariant. That's exactly the
+     class of thing evals catch that unit tests don't."
+```
+
+  ## Probe 11 — "how do you handle race conditions in a serverless setup?"
+
+  This is the concurrency-under-serverless probe. A judge is checking whether you understand where in-memory session state is actually safe and where it isn't. Answer with a lived receipt.
+
+  ┃ "The obvious one is shared-state Maps across warm-instance invocations. The one I hit was subtler — concurrent-briefing race in the same session. Four study audits flagged it; I read the code and reframed the actual mechanism from a shared-Map race to a concurrent-briefing race, then shipped a route-level gate at lib/state/in-flight-briefings.ts with eight tests. Commit cab85c6, two days ago. The gate is the honest answer — in-memory session state is fine per-instance; concurrent briefings on the same session are what needed guarding."
+
+  The move: **name the actual mechanism, not the assumed one, and point at the shipped gate**. The differentiator here is the reframing — the audits found a symptom, you found the real mechanism and shipped against that. That is a senior-signal answer.
+
+  Follow-up decision tree:
+
+```
+  If judge asks "what about across warm instances?" →
+    "Session state lives in memory per instance; the MCP server
+     rate-limits at ~1 req/s per workspace, so cross-instance
+     coordination is capped upstream. Multi-instance shared state
+     would need Redis or a DB — not built, called out honestly on
+     the scale probe."
+
+  If judge asks "how did you know it was concurrent-briefing and not
+     Map races?" →
+    "Read the code. The Map lookups were synchronous; the race was
+     between two briefing NDJSON streams for the same session
+     landing in overlapping windows. The gate reserves the session
+     for the in-flight briefing and rejects the second request until
+     the first drains. Eight tests cover it."
+```
+
   ## The off-script fallback — the "i don't know" move
 
   When a probe genuinely surprises you, do not fabricate. The strongest recovery move in a hackathon Q&A is naming the gap honestly.
@@ -297,7 +355,7 @@ Nine probes come up almost every time. You rehearse the verbatim answer to each.
   │  Posture:    short answers, point at receipts, own rough  │
   │              edges, never hedge                           │
   │                                                           │
-  │  The nine probes — recognize the category, pick the      │
+  │  The eleven probes — recognize the category, pick the    │
   │  answer:                                                  │
   │                                                           │
   │  1. "isn't synthetic fake?"                               │
@@ -340,6 +398,17 @@ Nine probes come up almost every time. You rehearse the verbatim answer to each.
   │     → 10 goldens, 2 rubrics × 4 dims, baseline.json       │
   │        (runId 2026-07-03T04-08-28-644Z), ~$0.09/case,    │
   │        p50 diagnose 50s / recommend 51s, CI wired         │
+  │                                                           │
+  │ 10. "did evals ever catch something?"                     │
+  │     → Move 3 · be05240 · filterSupportedHypotheses;       │
+  │        4 rec dims regressed 13–23pp; reverted;            │
+  │        negative-result rep = strongest single receipt     │
+  │                                                           │
+  │ 11. "race conditions in a serverless setup?"              │
+  │     → Move 4 · cab85c6 · 4 audits flagged; reframed       │
+  │        (concurrent-briefing race, not shared-Map race);   │
+  │        route-level gate at lib/state/in-flight-           │
+  │        briefings.ts + 8 tests                             │
   │                                                           │
   │  Off-script fallback:                                     │
   │    → name the file/module                                 │

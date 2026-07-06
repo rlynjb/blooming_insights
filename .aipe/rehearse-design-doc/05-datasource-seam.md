@@ -88,6 +88,8 @@ Each of those was a `new SomethingDataSource(...)` (or, in Session B, an env / h
 
 Use 5 is the load-bearing one for the defense: on Session B we swapped in a new MCP client abstraction and a three-provider auth strategy — a whole new authentication axis, not just a data-shape swap — without touching a single caller. Five different pressures, one interface, zero agent-surface changes. That's what "the abstraction survived real pressure" looks like when you actually measure it.
 
+**Second-order receipt (Move 4 — RFC-11):** the seam's abstraction was proven *again* under a completely different kind of pressure — a concurrent-request bug. The in-flight briefing gate that closes the same-session `putInsights` race landed at the *route* layer without touching `insights.ts`, without touching any adapter, and without touching a single line of DataSource-facing agent code. The port didn't need to be widened, narrowed, or re-shaped — because the concurrency bug lived one layer up from where the port sits. That's the mark of a healthy abstraction: unrelated fixes stay unrelated. The five-uses receipt is about swap-count under substitution pressure; the RFC-11 receipt is about *what stays untouched* when a bug arrives at a nearby layer. Two axes, same answer — the seam is holding.
+
 Beyond the swap-count receipt:
 
 - **Evals are reproducible and cheap.** Running the 10-case baseline against `SyntheticDataSource` finishes in seconds without touching Bloomreach.

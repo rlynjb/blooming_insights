@@ -56,6 +56,13 @@ The counterfactuals matrix. Each decision on the left; what you'd reconsider on 
   (generalize instead of        │ preset; 5th use of the
    hardcode Bloomreach)         │ same DataSource port
                               │
+  In-flight briefing gate     │ Route-level 409 (Move 4,
+  (Move 4 — cab85c6)            │ cab85c6). Shipped over
+                              │ state-level rework because
+                              │ audits named the race
+                              │ explicitly; 8 tests,
+                              │ suite 268 → 276
+                              │
 ```
 
 Four decisions to reconsider. Five decisions to keep. Every reconsideration has a trigger; every keep has a receipt. This is what the reflection round should look like.
@@ -251,6 +258,38 @@ Say this:
 ┃  pitch versus stronger seam receipt. I picked
 ┃  the stronger receipt."
 
+  ### The second counterfactual — what if I hadn't shipped the in-flight briefing gate (Move 4)?
+
+Volunteer this alongside the MCP-generalization counterfactual. It's the counterfactual for the newest ship on the codebase and it demonstrates you can distinguish "shipped because a queue said so" from "shipped because the defense-shape demanded it."
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "The concurrent-briefing race — how often     │
+│   does that actually fire? Was Move 4 worth     │
+│   shipping?"                                    │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you know how to price a fix against its    │
+│   real-world trigger rate? Or do you ship        │
+│   every named bug at the same priority?         │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"Honest counterfactual. The concurrent-briefing race is real but low-frequency in practice — it needs two tabs open on the same session on the same warm Vercel instance, and both tabs have to trigger a briefing inside the overlap window. In a portfolio with zero real users, it would have shipped silently for a long time.*
+>
+> *So on pure trigger-rate math, Move 4 was not the highest-leverage move on the recon queue. It's a 'known and unshipped' item that could have stayed there.*
+>
+> *The reason I shipped it: 'known and unshipped' is a worse defense than 'named and unshipped-because-of-priorities' when an interviewer reads the recon queue. Four fresh study audits called out `lib/state/insights.ts` explicitly. A senior interviewer scanning the queue would ask, "you knew about this race, why didn't you fix it?" That's a defensible question only if I have a stronger reason than "low trigger rate" — and for a 30-line, route-level, 8-test gate, I didn't. The cost of the fix was smaller than the cost of defending the deferral.*
+>
+> *The alternative — the state-level append-only rework with a `briefingId` field — I explicitly did NOT ship. That one's ~40 LOC plus schema churn plus reader rework, and it doesn't earn its cost until multi-briefing history is a product feature. I want that deferral in the record. It's the more interesting decision than shipping Move 4."*
+
+┃ "Move 4 shipped because the defense-shape
+┃  demanded it, not because the trigger-rate
+┃  demanded it. The state-level rework I
+┃  deliberately did NOT ship — that's the more
+┃  interesting deferral."
+
   ## The follow-up decision tree
 
 The reflection round has one specific follow-up shape you should be ready for:
@@ -361,9 +400,10 @@ What you'd change about the actual project: the four items on the reconsider lis
   → Portfolio hardening sequence → 6 phases, all shipped, COMPLETE, receipt-backed.
   → Swappable MCP client → 1 day of work on an existing seam; Bloomreach as default preset, not identity.
 
-**The counterfactual.**
+**The counterfactuals.**
 
   → What if I hadn't generalized the MCP client? Shorter pitch, simpler mental model — but abstraction-pressure receipt drops from 5 uses to 4, and the live-swap demo beat disappears. Not a regret. An honest tradeoff.
+  → What if I hadn't shipped the in-flight briefing gate (Move 4)? The concurrent-briefing race is low-frequency in practice (two tabs + warm instance + overlap window). Would have shipped silently for a long time. But 4 fresh audits named it — 'known and unshipped' would have been worse defense than shipping a 30-LOC route-level gate. The interesting deferral is the state-level append-only rework, which I deliberately did NOT ship.
 
 **The pull quotes.**
 

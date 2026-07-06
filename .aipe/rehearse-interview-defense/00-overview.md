@@ -74,11 +74,11 @@ The reader who only stares at this diagram for two minutes should be able to nam
 
   **02 — The architecture.** The whiteboard walk. Four bands, one request, one investigation. The diagram you re-draw from memory in 90 seconds without hesitation.
 
-  **03 — The choices.** Six load-bearing choices, plus a swappable-MCP defense embedded in Choice 3. Framework (Next.js 16). Own loop → AptKit migration. DataSource seam (5 uses, 0 caller changes; Bloomreach is the default preset, not the codebase identity — the swappable-MCP receipt lives here). NDJSON over SSE. Deterministic supervisor. And the closer: the sequenced portfolio hardening plan, COMPLETE.
+  **03 — The choices.** Six load-bearing choices, plus a swappable-MCP defense (3b) and an in-flight briefing gate defense (3c) embedded in Choice 3. Framework (Next.js 16). Own loop → AptKit migration. DataSource seam (5 uses, 0 caller changes; Bloomreach is the default preset, not the codebase identity — the swappable-MCP receipt lives here; the route-level 409 gate for concurrent same-session briefings is the newest 3c fix on top of it). NDJSON over SSE. Deterministic supervisor. And the closer: the sequenced portfolio hardening plan, COMPLETE.
 
   **04 — The scale story.** Three scenarios (10× users · 100× investigations · 10× peak QPS). Real p50 numbers. The bottleneck named for each.
 
-  **05 — The failure story.** The fault-injection receipt: 9 injected faults across 3 investigations, 0 investigation failures. How the AptKit agent loop presents `is_error:true` back to the model and lets it reason around the fault.
+  **05 — The failure story.** The fault-injection receipt: 9 injected faults across 3 investigations, 0 investigation failures. How the AptKit agent loop presents `is_error:true` back to the model and lets it reason around the fault. Plus the concurrent-briefing race caught and fixed by a route-level in-flight gate — 8 tests, suite 268 → 276.
 
   **06 — The hard parts.** The `insights.ts` concurrent-user wipe (AI wrote it, you accepted it, you found the bug, you shipped the fix). The portfolio hardening plan shipped end-to-end. And the one you can't fully defend: the `actionable_next_step` 0% baseline.
 

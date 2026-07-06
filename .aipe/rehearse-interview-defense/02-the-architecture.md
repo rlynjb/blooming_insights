@@ -45,6 +45,16 @@ This is the whiteboard walk. Every hop labeled, every band named, every seam mar
   │      throw, on malformed input → falls through to env)           │
   │    → passed to makeDataSource(mode, override)                    │
   │                                                                  │
+  │  ─── in-flight briefing gate ─────────────────────────────────   │
+  │  lib/state/in-flight-briefings.ts                                │
+  │    Map<sessionId, AbortController>                               │
+  │    → tryAcquireBriefing(sessionId)                               │
+  │        acquired:true  → proceed, release() in finally            │
+  │        acquired:false → 409 + Retry-Hint (concurrent same-       │
+  │                         session, e.g. two tabs)                  │
+  │    ↑ sits between the dsResult.ok check and the dataSource       │
+  │      binding on /api/briefing                                    │
+  │                                                                  │
   │  lib/state/insights.ts                                           │
   │    session-keyed Map<sessionId, SessionFeed>                     │
   │    ↑ was Map<id, Insight> (AI-defaulted, concurrent-user wipe)   │
@@ -148,7 +158,7 @@ The strong answer walks the four bands in order, names the two off-to-the-side s
 >
 > *[Draw browser band] Top band is the browser. React 19, Next.js 16. `app/page.tsx` is extracted into three hooks — `useBriefing`, `useLiveMode`, `useInvestigation`. The default mode is `live-synthetic` — real agents against local fake data, no OAuth required — with `demo` and `live-mcp` as the other two. When the user picks `live-mcp`, a settings modal appears — `McpConfigModal` — that lets them plug in their own MCP server URL, auth type, and bearer token. The panel that streams the agents' reasoning is `StatusLog` wrapping `ReasoningTrace`. All the streaming surfaces — the briefing, the diagnose step, the recommend step, and the free-form query — consume one shared kernel called `readNdjson`, which is 64 lines of code. Four consumers, one kernel. That's the strongest deduplication receipt on the frontend.*
 >
-> *[Draw route band] Second band is the Next.js route layer. Two main routes — `/api/briefing` for the monitoring pass, and `/api/agent` for the diagnostic and recommendation steps. On every request, the route decodes an `x-bi-mcp-config` header — that's the transport for the settings-modal override — validates it with `isMcpConfigOverride`, and passes it into `makeDataSource`. If the header is malformed, `decodeConfigHeader` returns `null` rather than throwing, and the route falls through to env defaults. The `maxDuration` is 300 seconds because Vercel's Pro tier maxes there, and I have a 300-second route budget composed with 30-second per-call timeouts at `lib/mcp/transport.ts`. Session state lives in a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed, which I'll come back to when we talk about the concurrent-user bug.*
+> *[Draw route band] Second band is the Next.js route layer. Two main routes — `/api/briefing` for the monitoring pass, and `/api/agent` for the diagnostic and recommendation steps. On every request, the route decodes an `x-bi-mcp-config` header — that's the transport for the settings-modal override — validates it with `isMcpConfigOverride`, and passes it into `makeDataSource`. If the header is malformed, `decodeConfigHeader` returns `null` rather than throwing, and the route falls through to env defaults. On `/api/briefing`, there's an in-flight gate between the datasource check and the dataSource binding — `tryAcquireBriefing(sessionId)` at `lib/state/in-flight-briefings.ts`. If a concurrent same-session request arrives — usually two tabs open on the same warm instance — the second one gets a 409 with a retry hint rather than racing the first request's `putInsights` at the end of the ~30–90s pipeline. The `maxDuration` is 300 seconds because Vercel's Pro tier maxes there, and I have a 300-second route budget composed with 30-second per-call timeouts at `lib/mcp/transport.ts`. Session state lives in a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed, which I'll come back to when we talk about the concurrent-user bug.*
 >
 > *[Draw agent band] Third band is the agent layer. Five agents on top of `@aptkit/core@0.3.0` — monitoring, diagnostic, query, recommendation, and a Haiku classifier called `classifyIntent`. The Haiku classifier is the deterministic supervisor — a small model routing to a big model. AptKit is my agent primitive; I wrapped it in about 263 lines of adapter code — three classes: `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`. The legacy pre-AptKit loop is still in the repo at `*-legacy.ts` as a rollback receipt.*
 >
