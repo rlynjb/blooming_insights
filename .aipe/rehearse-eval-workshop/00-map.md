@@ -61,7 +61,7 @@ is — because "eval" means different things for RAG vs an agent vs a
 plain-LLM app. Read from disk (`app/api/agent/route.ts`, `lib/agents/*`,
 `eval/run.eval.ts`, `eval/goldens/*`):
 
-- **Shape: multi-agent LLM-app.** Deterministic supervisor (`app/api/agent/route.ts:222–345`) routes to five agents: `monitoring`, `diagnostic`, `query`, `recommendation`, plus a `classifyIntent` Haiku call. Handoff between diagnose → recommend is a strongly-typed `Diagnosis` object.
+- **Shape: multi-agent LLM-app.** Deterministic supervisor (`app/api/agent/route.ts:242–365`) routes to five agents: `monitoring`, `diagnostic`, `query`, `recommendation`, plus a `classifyIntent` Haiku call. Handoff between diagnose → recommend is a strongly-typed `Diagnosis` object.
 - **NOT a RAG app.** No vector store, no embeddings, no ANN retrieval. Retrieval happens via MCP tool calls (`execute_analytics_eql`, etc.) issued by the diagnostic agent against Bloomreach's loomi-connect MCP server. Which means Exercise 07 (RAG track) is SKIPPED — see below.
 - **NOT plain-LLM.** The agent loop is not one shot; it's tool-use with a supervisor. Exercise 08 (agent track) APPLIES.
 
@@ -135,7 +135,7 @@ runId `2026-07-03T04-08-28-644Z`):
 **The lived receipt (Move 3, commit `be05240`).** You shipped
 `filterSupportedHypotheses` at the handoff. Eval regressed all 4 rec dims
 by 13–23pp case-matched. You reverted. Tombstone at
-`lib/agents/recommendation.ts:15-25`. This IS the answer to "why do you
+`lib/agents/recommendation.ts:31-41`. This IS the answer to "why do you
 trust the eval?" — because the eval caught a wrong mental model you didn't
 know you had. Exercise 10 makes you say that sentence out loud.
 

@@ -1,3 +1,18 @@
+// lib/agents/recommendation.ts
+//
+// The recommendation agent — the LAST agent in the diagnose → recommend
+// pipeline. Given an anomaly + the diagnostic agent's Diagnosis, it proposes
+// the actions a marketer/analyst would actually take.
+//
+// ─── Pattern: compatibility wrapper (adapter over a reusable agent) ───────
+// Blooming owns this thin constructor; @aptkit/core owns the reusable
+// AptKitRecommendationAgent. The wrapper adapts Blooming's types into aptkit's
+// model / tools / workspace / trace ports via the *Adapter classes, so the
+// reusable agent stays domain-agnostic while Blooming keeps a stable call
+// site. The tombstone NOTE below is the workshop's "lived receipt" (Move 3):
+// a handoff filter that was tried, regressed the eval, and got reverted — the
+// answer to "why do you trust the eval?" (workshop Ex 10).
+//
 import Anthropic from '@anthropic-ai/sdk';
 import {
   RecommendationAgent as AptKitRecommendationAgent,

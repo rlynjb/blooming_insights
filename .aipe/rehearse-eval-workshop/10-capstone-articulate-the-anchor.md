@@ -39,7 +39,7 @@ You have three artifacts. All on disk. Every one is real.
      eval/gate-2026-07-03T18-11-06-952Z.json (the gate output that fired)
      → commit be05240 shipped filterSupportedHypotheses at the handoff
      → eval regressed all 4 rec dims by 13-23pp case-matched
-     → reverted; tombstone at lib/agents/recommendation.ts:15-25
+     → reverted; tombstone at lib/agents/recommendation.ts:31-41
      → the eval was doing exactly what the eval is for
 
   3. THE BASELINE (Exercise 09)

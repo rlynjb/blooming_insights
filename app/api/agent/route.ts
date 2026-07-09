@@ -1,3 +1,23 @@
+// app/api/agent/route.ts
+//
+// The investigation API route — the deterministic SUPERVISOR of Blooming's
+// multi-agent LLM app. One GET streams an investigation (or a free-form
+// query) to the client as NDJSON, routing to specialized agents in a fixed
+// order rather than letting a model decide the control flow.
+//
+// ─── Pattern: deterministic supervisor over specialized agents ────────────
+// The app "shape" the eval workshop names (.aipe/rehearse-eval-workshop/
+// 00-map.md): NOT RAG, NOT plain-LLM — a supervisor / orchestrator. This route
+// owns the control flow (classifyIntent → diagnostic → recommendation, or the
+// query agent), and the diagnose → recommend handoff is a strongly-typed
+// `Diagnosis` object, not free text. That typed handoff is what makes the
+// coordination graded-able (see workshop Ex 08, agent track). Sub-patterns:
+//   · streaming (ReadableStream → NDJSON) so the client sees progress live
+//   · cache-first replay (precomputed investigations replay without a key)
+//   · cooperative cancellation (req.signal threaded through every async layer)
+//   · phase timing emitted once in `finally` (survives a mid-phase throw)
+//   · secret redaction on every error path before it reaches logs or the wire
+//
 import { NextRequest, NextResponse } from 'next/server';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';

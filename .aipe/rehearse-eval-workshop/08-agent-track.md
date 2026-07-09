@@ -51,7 +51,7 @@ hypothesis the diagnosis explicitly marked `supported: false`. The
 judge caught it *because it could see the diagnosis object in the
 context*. You shipped a fix (`filterSupportedHypotheses`); the eval
 regressed all 4 rec dims by 13–23pp case-matched; you reverted.
-Tombstone at `lib/agents/recommendation.ts:15–25` documents why.
+Tombstone at `lib/agents/recommendation.ts:31–41` documents why.
 
 **That negative-result rep is the L3 signal.** Not "I built an eval" —
 "I ran the eval, it caught my wrong mental model before it shipped, I
