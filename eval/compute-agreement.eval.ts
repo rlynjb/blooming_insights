@@ -14,6 +14,16 @@
 // stderr table. This is the receipt that survives interview scrutiny
 // ("shipped, calibrated, N/M user-vs-judge agreement across 4 dims").
 //
+// ─── Pattern: judge calibration / inter-rater agreement ───────────────────
+// Validates the JUDGE itself. Compares blind human labels (the worksheet)
+// against the judge's scores and reports agreement — verdict match, exact
+// dimension match, within-1. This inter-annotator-agreement number is what
+// lets you trust an LLM-as-judge at all. Sub-patterns: a fail-closed
+// guardrail (refuses partial worksheets, so no misleading partial number),
+// and an honesty tag (pilot-ai-vs-ai mode is stamped NOT interview-
+// defensible). Pairs with generate-worksheet.eval.ts, which produces the
+// blind worksheet this reads.
+//
 // Usage:
 //   npm run eval:agreement
 //     → reads the LATEST runId's worksheet by default

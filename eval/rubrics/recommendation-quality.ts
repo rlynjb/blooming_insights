@@ -5,6 +5,13 @@
 // checks. Domain data lives in blooming; the judging engine lives in
 // @aptkit/evals via @aptkit/core.
 //
+// ─── Pattern: scoring rubric (criteria-as-data for LLM-as-judge) ──────────
+// The recommendation-side twin of diagnosis-quality.ts's rubric: judgment
+// criteria as anchored, named data. Adds binary `checks` alongside the scored
+// dimensions — a checklist for pass/fail properties that don't need a 1–5
+// scale. Written around explicit failure modes (below) so the scale anchors
+// target the ways a recommendation actually goes wrong.
+//
 // A recommendation is the last agent's output in the pipeline. It matters
 // because it's what a marketer/analyst would ACT on. The failure modes we're
 // scoring against:

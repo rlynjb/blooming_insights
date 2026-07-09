@@ -5,6 +5,14 @@
 // dimension's pass rate has dropped by more than GATE_MAX_REGRESSION
 // (default 0.10 = 10 percentage points).
 //
+// ─── Pattern: regression gate / ratchet (CI quality guardrail) ────────────
+// Recomputes the candidate run's aggregate (reusing baseline.eval's
+// computeBaseline), diffs it against the committed baseline, and FAILS if any
+// dimension's pass-rate dropped past the threshold. The snapshot-comparison +
+// guardrail pattern: throwing makes vitest exit non-zero, so a regressed PR
+// check goes red. Sub-patterns: threshold/ratchet gate, script-as-test
+// (describe.skipIf(!RUN_GATE)), and a written gate-<runId>.json receipt.
+//
 // Wire into CI as: `npm run eval && npm run eval:gate` — the latter
 // exits non-zero on regression, which fails the PR check.
 //

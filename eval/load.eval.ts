@@ -5,6 +5,15 @@
 // observability (tokens + cost + latency). Aggregates p50/p95/p99 across
 // the load run and emits a load receipt.
 //
+// ─── Pattern: load / soak harness (+ chaos fault injection) ───────────────
+// Characterizes THROUGHPUT and LATENCY, not quality: fires N investigations
+// through a worker-pool at concurrency K, skips the judges entirely, and
+// reduces results to p50/p95/p99 distributions. Sub-patterns: semaphore /
+// worker-pool concurrency (shared index queue), percentile aggregation,
+// isolate-failures (one investigation's error doesn't stop other workers),
+// and optional fault injection (chaos testing) via FaultInjectingDataSource
+// with a seed for deterministic-yet-varied reproducibility.
+//
 // Difference from `eval/run.eval.ts`:
 //   · run.eval.ts: 10 goldens, ALL judged, receipt has verdicts
 //   · load.eval.ts: N investigations (default 20, env LOAD_N=…),

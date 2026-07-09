@@ -9,6 +9,14 @@
 // The compute-agreement script then reads the filled worksheet + the
 // receipts and computes user-vs-judge agreement.
 //
+// ─── Pattern: blind-labeling setup (anti-anchoring) ───────────────────────
+// Emits a judgment-FREE worksheet (anomaly + diagnosis + blank score slots)
+// so the human labels WITHOUT seeing the judge's answer. Deliberately hiding
+// the judge output prevents anchoring bias — this is the setup half of the
+// calibration loop that compute-agreement.eval.ts closes. Sub-patterns:
+// separation-of-concerns (generate vs score are two scripts) and
+// script-as-test (describe.skipIf(!RUN_WORKSHEET)).
+//
 // Usage:
 //   npm run eval:worksheet
 //     → reads the LATEST runId's receipts by default

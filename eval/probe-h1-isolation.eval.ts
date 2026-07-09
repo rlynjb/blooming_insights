@@ -19,6 +19,15 @@
 //   scoped tightly to payment failure, H1 is confirmed.
 //
 // Runs 3 times against case 08's anomaly for reproducibility.
+//
+// ─── Pattern: controlled isolation experiment (systematic debugging) ──────
+// A debugging probe, NOT a scored eval. Feeds the rec agent a hand-built,
+// single-hypothesis diagnosis to ISOLATE one variable and confirm/refute a
+// named hypothesis (H1) about where a coordination failure originates. The
+// controlled-experiment / minimal-repro pattern: hold everything fixed, vary
+// one input, observe the output. Sub-patterns: repeat N times (runs 1–3) to
+// check reproducibility, and fingerprint the output to .aipe/drills for the
+// drill record. Ungated (no skipIf) — it's run by hand during a drill, not CI.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';

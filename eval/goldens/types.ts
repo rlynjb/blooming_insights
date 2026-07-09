@@ -8,6 +8,13 @@
 // actually support the anomaly. `no-signal` cases test the agent's
 // hallucination resistance — it should say "insufficient evidence"
 // rather than confabulate.
+//
+// ─── Pattern: labeled fixture with a negative-case taxonomy ───────────────
+// signalClass is the label that lets run.eval.ts gate SELECTIVELY (only
+// has/partial-signal cases are hard-gated). Deliberately including no-signal
+// and positive cases is the "test the refusal / unhappy path too" discipline
+// — a golden set of only happy paths measures nothing about confabulation.
+// knownCorrect is the per-case expectation fed to the judge as context.
 
 import type { Anomaly } from '../../lib/mcp/types';
 

@@ -4,6 +4,13 @@
 // each 1–5. Domain data lives in blooming (this file); the judging engine
 // (`RubricJudge`, `RubricDefinition`) lives in @aptkit/evals via @aptkit/core.
 //
+// ─── Pattern: scoring rubric (criteria-as-data for LLM-as-judge) ──────────
+// Externalizes the judgment criteria as DATA, not prose baked into a prompt:
+// named dimensions, each with an anchored 1–5 scale. That's what makes the
+// judge auditable, tunable, and calibratable (see compute-agreement.eval.ts).
+// Anchored scales exist to reduce judge variance — every score has a concrete
+// definition rather than a vibe.
+//
 // This rubric is intentionally shaped like what the retired Phase 3 pipeline
 // scored — five criteria collapsed into four here (drop the "phrasing" one;
 // it was noise, not signal). The Week-2 calibration slice will re-measure

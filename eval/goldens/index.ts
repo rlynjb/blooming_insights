@@ -3,6 +3,11 @@
 // Aggregate export of all golden cases. Consumed by eval/run.eval.ts's
 // `it.each(goldens)` iteration.
 //
+// ─── Pattern: golden dataset (the eval's fixed input set) ─────────────────
+// This IS the "golden" in the golden-set eval pattern — the curated, version-
+// controlled set of cases every harness runs against (run, load, worksheet).
+// One case per file (easy to review/diff), collected here into one array.
+//
 // Order matters — the runner runs cases sequentially, so #1 (the canonical
 // happy path) goes first and no-signal cases are interleaved with has-signal
 // ones to keep the receipt pattern readable in the summary.

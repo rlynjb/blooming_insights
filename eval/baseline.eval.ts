@@ -5,6 +5,15 @@
 // distributions across cases; writes eval/baseline.json — the committed
 // artifact the regression gate compares candidate runs against.
 //
+// ─── Pattern: golden-master / snapshot baseline ───────────────────────────
+// Reduces one run's receipts into a COMMITTED reference artifact
+// (baseline.json) that later runs get measured against — the "golden master"
+// half of a snapshot-comparison pair (gate.eval.ts is the other half).
+// Sub-patterns: map-reduce over receipts (aggregate → per-dimension rates),
+// persist-as-fixture, and script-as-test — env-gated with
+// describe.skipIf(!RUN_BASELINE) so it's a CLI tool borrowing the vitest
+// runner while staying out of `npm test`.
+//
 // Usage:
 //   npm run eval:baseline
 //     → reads the LATEST runId's receipts and writes eval/baseline.json
