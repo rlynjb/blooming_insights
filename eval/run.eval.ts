@@ -2,6 +2,58 @@
 //
 // Week-2 harness — 10 golden cases wired through both rubrics.
 //
+// ─── Pattern: golden-set, LLM-as-judge eval harness on a test runner ──────
+//
+// The overarching shape is the GOLDEN-DATASET LLM-EVAL pattern ("evals as
+// tests"): a fixed set of curated cases → run through the system → score →
+// aggregate. It's the LLM analog of a regression suite, except outputs are
+// non-deterministic, so it measures quality distributions rather than
+// asserting exact values. It composes these sub-patterns:
+//
+//   1. LLM-as-judge          — a separate model (RubricJudge + rubric) grades
+//                              each output instead of exact-match assertions.
+//   2. Rubric / scored dims  — judgments are per-dimension scores (≥4 = pass)
+//                              plus a verdict, aggregated into pass-rates.
+//   3. Staged pipeline       — diagnose → judge → recommend → judge; each
+//                              stage feeds the next, each has its own judge.
+//   4. Receipt / artifact log — every case writes a durable JSON receipt
+//                              (tokens, cost, traces, scores). The receipt is
+//                              the real deliverable; pass/fail is secondary.
+//   5. Fixture map-reduce     — beforeAll = setup, it.each = map one run per
+//                              case, afterAll = reduce receipts to summaries.
+//   6. Null-object degrade    — a judge failure yields a synthetic
+//                              `judge_error` judgment (buildJudgmentPlaceholder)
+//                              so the batch stays resilient and data stays whole.
+//   7. Meta-evaluation        — the escape-hatch check evaluates the EVAL
+//                              itself (does the rubric discriminate?).
+//
+// It is deliberately NOT a unit/integration test: excluded from `npm test`,
+// it gates only certain signal classes and its output is a quality report,
+// not a green checkmark.
+//
+// ─── Why this is a `.eval.ts` "test" file that also contains agent code ───
+//
+// This is an EVAL HARNESS dressed up as a vitest test file — that's the
+// design, not an accident. vitest is borrowed here as an ORCHESTRATION
+// RUNTIME (not for unit testing), because it hands us four things for free:
+//   · beforeAll     → mint one shared runId + Anthropic client for the batch
+//   · it.each       → one reported row per golden case, isolated, each with
+//                     its own per-case timeout (a plain for-loop gives neither)
+//   · expect        → the actual pass/fail gate
+//   · afterAll      → aggregate every receipt into the summary tables
+//
+// The "code" (investigate → judge → recommend → judge → write receipt) lives
+// INLINE in each it.each case rather than in a library the test calls, because
+// each case IS one full end-to-end run — the test and the thing-under-test are
+// the same object. And the rich receipts + summary reporting ARE the point of
+// the run, so that observability can't be hidden behind a library boundary.
+//
+// This is LLM-eval, not a normal test: outputs are non-deterministic (an
+// LLM's diagnosis, scored by another LLM), so it does two un-test-like things
+//   · gates by signal class, not blanket pass/fail (see the gate below)
+//   · writes a JSON receipt per case + prints aggregate quality tables,
+//     because a green/red result carries too little signal on its own.
+//
 // Shape:
 //   · `beforeAll` mints a shared runId all cases use
 //   · `it.each(goldens)` runs each golden case as its own test row
@@ -17,9 +69,12 @@
 // Runner: vitest via `npm run eval` (uses vitest.eval.config.ts).
 // Excluded from `npm test`.
 
+// Node built-ins — read .env, write receipts, resolve dirs.
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// The raw LLM client + aptkit's eval primitives: RubricJudge (LLM-as-judge),
+// usage/cost helpers, and their types.
 import Anthropic from '@anthropic-ai/sdk';
 import {
   RubricJudge,
@@ -31,6 +86,8 @@ import {
 } from '@aptkit/core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+// Local code under test — the two agents, adapters, pricing, budget, the
+// synthetic data source, and the golden cases + rubrics that drive the eval.
 import { DiagnosticAgent } from '../lib/agents/diagnostic';
 import { RecommendationAgent } from '../lib/agents/recommendation';
 import { AnthropicModelProviderAdapter } from '../lib/agents/aptkit-adapters';
@@ -49,6 +106,10 @@ import { recommendationQualityRubric } from './rubrics/recommendation-quality';
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
+// Hand-rolled dotenv parser (no dependency just for the eval). Walks
+// .env.local then .env, regex-matches KEY=value lines, strips surrounding
+// quotes, and sets process.env WITHOUT overwriting anything already set.
+// Called at module load (below) so ANTHROPIC_API_KEY exists before any case.
 function loadEnvFromDotenv(): void {
   const candidates = ['.env.local', '.env'];
   for (const name of candidates) {
@@ -129,6 +190,10 @@ function usageWithCost(usage: TokenUsageSummary, cost: CostEstimate | undefined)
 
 // ─── trace formatting ────────────────────────────────────────────────────────
 
+// Render the recorded tool calls into a human-readable text block for the
+// judge to read as context. Numbers each call and prints its name, args, and
+// either the error or the result — truncating results to 4000 chars so a huge
+// tool payload can't blow up the judge's context window.
 function formatToolCallTrace(calls: readonly ToolCall[]): string {
   if (calls.length === 0) return '(no tool calls recorded)';
   const lines: string[] = [];
@@ -158,6 +223,8 @@ const RECEIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'receipts'
 let sharedRunId: string;
 let sharedAnthropic: Anthropic;
 
+// `describe` is the batch; `beforeAll` sets up shared state used by every
+// case (see header for why vitest, not a bespoke runner, hosts this).
 describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality', () => {
   beforeAll(() => {
     if (!process.env.ANTHROPIC_API_KEY) {
@@ -172,9 +239,16 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
     console.log(`[eval] cases:  ${goldens.length}`);
   });
 
+  // Each golden case becomes its own test row. The whole agent pipeline runs
+  // INLINE below — this callback IS the thing under evaluation, not a wrapper
+  // around it. The 600_000 arg (bottom of this block) is vitest's per-case
+  // timeout, which is a chunk of why we lean on it.each instead of a for-loop.
   it.each(goldens.map((g) => [g.caseId, g]))(
     'case %s',
     async (_label, goldenCase: GoldenCase) => {
+      // ─── setup ────────────────────────────────────────────────────────
+      // Fresh synthetic data source + tool list per case, plus a case-scoped
+      // sessionId. Nothing here talks to the LLM yet.
       const caseStart = performance.now();
       const dataSource = new SyntheticDataSource();
       const schema = syntheticWorkspaceSchema;
@@ -328,6 +402,11 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
       const recommendationJudgeMs = Math.round(performance.now() - t0RecommendJudge);
 
       // ─── receipt ──────────────────────────────────────────────────────
+      // Assemble the big per-case JSON: run metadata, per-phase durations,
+      // models, anomaly summary, tool-call summaries, usage/cost, budget
+      // snapshot, and the diagnosis + recommendations with their judgments.
+      // This file is the durable artifact the afterAll summary reads back.
+      //
       // If the diagnosis judge failed, we still write a receipt (with a
       // placeholder judgment + the error) so the summary block can see the
       // case as "judge_error" rather than have it disappear.
@@ -403,9 +482,12 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
         `[case ${goldenCase.caseId}] done in ${Math.round((performance.now() - caseStart) / 1000)}s · diagnosis: ${dv} · recs: [${rvs || '(none)'}]`,
       );
 
-      // Signal-class-aware gate:
+      // Signal-class-aware gate — the one spot where this stops looking like
+      // a normal test. A normal test asserts a deterministic output; here the
+      // "output" is LLM quality scored by another LLM, so we only turn certain
+      // classes into a hard expect() and leave the rest as measured-not-gated:
       //   has-signal / partial-signal → the agent SHOULD produce a
-      //     non-fail diagnosis. A fail is a bug.
+      //     non-fail diagnosis. A fail is a bug → gated with expect().
       //   no-signal / positive         → measured, not gated. A fail
       //     here is a data point (confabulation or unhandled positive).
       //   judge_error                  → never gated; the model output
@@ -427,6 +509,12 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
   );
 
   afterAll(() => {
+    // The reporting layer — and the reason vitest's afterAll is worth
+    // borrowing. A green/red pass carries too little signal for an eval, so
+    // here we walk every receipt this run wrote and print aggregate quality
+    // tables (per-case verdicts, per-dimension pass rates, escape-hatch check).
+    // This observability IS the deliverable of the run, not a side effect.
+    //
     // Walk the receipts dir for files matching this run's runId; build a
     // summary table across all cases.
     if (!sharedRunId) return;
@@ -476,6 +564,9 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
     console.error('╚══════════════════════════════════════════════════════════════════════════════╝');
 
     // ─── per-dimension pass rate ─────────────────────────────────────────
+    // dimAgg tallies pass/total/score-distribution per rubric dimension
+    // (score ≥ 4 counts as pass); printDims renders it with a 1:_ 2:_ …
+    // histogram. Run for both the diagnosis and recommendation rubrics.
     const dimAgg = (
       key: 'diagnosisJudgment' | 'recommendationJudgment',
     ): Record<string, { pass: number; total: number; scores: number[] }> => {
@@ -513,6 +604,9 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
     printDims('RECOMMENDATION', dimAgg('recommendationJudgment'));
 
     // ─── escape-hatch check (Q1 pre-agreed criterion) ────────────────────
+    // Quality check on the eval itself: count DISTINCT scores per diagnosis
+    // dimension and flag any with fewer than 3 as "substrate too homogeneous"
+    // — i.e. the rubric isn't discriminating between cases.
     console.error('\nEscape-hatch check (≥3 distinct pass/fail patterns per dimension)');
     console.error('─'.repeat(78));
     const dAgg = dimAgg('diagnosisJudgment');
